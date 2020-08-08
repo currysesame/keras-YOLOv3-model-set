@@ -2,7 +2,7 @@
 # -*- coding=utf-8 -*-
 """Model utility functions."""
 from tensorflow.keras.optimizers import Adam, RMSprop, SGD
-from tensorflow.keras.optimizers.schedules import ExponentialDecay, PolynomialDecay
+from tensorflow.keras.optimizers.schedules import ExponentialDecay, PolynomialDecay, PiecewiseConstantDecay
 from tensorflow.keras.experimental import CosineDecay
 from tensorflow_model_optimization.sparsity import keras as sparsity
 
@@ -109,6 +109,11 @@ def get_lr_scheduler(learning_rate, decay_type, decay_steps):
         lr_scheduler = ExponentialDecay(initial_learning_rate=learning_rate, decay_steps=decay_steps, decay_rate=0.9)
     elif decay_type == 'polynomial':
         lr_scheduler = PolynomialDecay(initial_learning_rate=learning_rate, decay_steps=decay_steps, end_learning_rate=learning_rate/100)
+    elif decay_type == 'piecewise_constant':
+        #apply a piecewise constant lr scheduler, including warmup stage
+        boundaries = [500, int(decay_steps*0.9), decay_steps]
+        values = [0.001, learning_rate, learning_rate/10., learning_rate/100.]
+        lr_scheduler = PiecewiseConstantDecay(boundaries=boundaries, values=values)
     else:
         raise ValueError('Unsupported lr decay type')
 
@@ -121,11 +126,11 @@ def get_optimizer(optim_type, learning_rate, decay_type='cosine', decay_steps=10
     lr_scheduler = get_lr_scheduler(learning_rate, decay_type, decay_steps)
 
     if optim_type == 'adam':
-        optimizer = Adam(learning_rate=lr_scheduler)
+        optimizer = Adam(learning_rate=lr_scheduler, amsgrad=False)
     elif optim_type == 'rmsprop':
-        optimizer = RMSprop(learning_rate=lr_scheduler)
+        optimizer = RMSprop(learning_rate=lr_scheduler, rho=0.9, momentum=0.0, centered=False)
     elif optim_type == 'sgd':
-        optimizer = SGD(learning_rate=lr_scheduler)
+        optimizer = SGD(learning_rate=lr_scheduler, momentum=0.0, nesterov=False)
     else:
         raise ValueError('Unsupported optimizer type')
 

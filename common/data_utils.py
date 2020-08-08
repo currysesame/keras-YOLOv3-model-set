@@ -2,8 +2,10 @@
 # -*- coding=utf-8 -*-
 """Data process utility functions."""
 import numpy as np
-from PIL import Image, ImageEnhance
+import random
 import cv2
+from PIL import Image, ImageEnhance, ImageFilter
+import imgaug.augmenters as iaa
 #from matplotlib.colors import rgb_to_hsv, hsv_to_rgb
 
 
@@ -286,62 +288,62 @@ def random_sharpness(image, jitter=.5):
     return new_image
 
 
-def random_horizontal_flip(image, jitter=.5):
+def random_horizontal_flip(image, prob=.5):
     """
     Random horizontal flip for image
 
     # Arguments
         image: origin image for horizontal flip
             PIL Image object containing image data
-        jitter: jitter range for flip probability,
+        prob: probability for random flip,
             scalar to control the flip probability.
 
     # Returns
         image: adjusted PIL Image object.
         flip: boolean flag for horizontal flip action
     """
-    flip = rand() < jitter
+    flip = rand() < prob
     if flip:
         image = image.transpose(Image.FLIP_LEFT_RIGHT)
 
     return image, flip
 
 
-def random_vertical_flip(image, jitter=.2):
+def random_vertical_flip(image, prob=.2):
     """
     Random vertical flip for image
 
     # Arguments
         image: origin image for vertical flip
             PIL Image object containing image data
-        jitter: jitter range for flip probability,
+        prob: probability for random flip,
             scalar to control the flip probability.
 
     # Returns
         image: adjusted PIL Image object.
         flip: boolean flag for vertical flip action
     """
-    flip = rand() < jitter
+    flip = rand() < prob
     if flip:
         image = image.transpose(Image.FLIP_TOP_BOTTOM)
 
     return image, flip
 
 
-def random_grayscale(image, jitter=.2):
+def random_grayscale(image, prob=.2):
     """
     Random convert image to grayscale
 
     # Arguments
         image: origin image for grayscale convert
             PIL Image object containing image data
-        jitter: jitter range for convert probability,
+        prob: probability for grayscale convert,
             scalar to control the convert probability.
 
     # Returns
         image: adjusted PIL Image object.
     """
-    convert = rand() < jitter
+    convert = rand() < prob
     if convert:
         #convert to grayscale first, and then
         #back to 3 channels fake RGB
@@ -349,6 +351,372 @@ def random_grayscale(image, jitter=.2):
         image = image.convert('RGB')
 
     return image
+
+
+def random_blur(image, prob=.1):
+    """
+    Random add normal blur to image
+
+    # Arguments
+        image: origin image for blur
+            PIL Image object containing image data
+        prob: probability for blur,
+            scalar to control the blur probability.
+
+    # Returns
+        image: adjusted PIL Image object.
+    """
+    blur = rand() < prob
+    if blur:
+        image = image.filter(ImageFilter.BLUR)
+
+    return image
+
+
+def random_motion_blur(image, prob=.1):
+    """
+    Random add motion blur on image
+
+    # Arguments
+        image: origin image for motion blur
+            PIL Image object containing image data
+        prob: probability for blur,
+            scalar to control the blur probability.
+
+    # Returns
+        image: adjusted PIL Image object.
+    """
+    motion_blur = rand() < prob
+    if motion_blur:
+        img = np.array(image)
+        # random blur severity from 1 to 5
+        severity = np.random.randint(1, 6)
+
+        seq = iaa.Sequential([iaa.imgcorruptlike.MotionBlur(severity=severity)])
+        #seq = iaa.Sequential([iaa.MotionBlur(k=30)])
+
+        img = seq(images=np.expand_dims(img, 0))
+        image = Image.fromarray(img[0])
+
+    return image
+
+
+def merge_mosaic_bboxes(bboxes, crop_x, crop_y, image_size):
+    # adjust & merge mosaic samples bboxes as following area order:
+    # -----------
+    # |     |   |
+    # |  0  | 3 |
+    # |     |   |
+    # -----------
+    # |  1  | 2 |
+    # -----------
+    assert bboxes.shape[0] == 4, 'mosaic sample number should be 4'
+    max_boxes = bboxes.shape[1]
+    height, width = image_size
+    merge_bbox = []
+    for i in range(bboxes.shape[0]):
+        for box in bboxes[i]:
+            x_min, y_min, x_max, y_max = box[0], box[1], box[2], box[3]
+
+            if i == 0: # bboxes[0] is for top-left area
+                if y_min > crop_y or x_min > crop_x:
+                    continue
+                if y_max > crop_y and y_min < crop_y:
+                    y_max = crop_y
+                if x_max > crop_x and x_min < crop_x:
+                    x_max = crop_x
+
+            if i == 1: # bboxes[1] is for bottom-left area
+                if y_max < crop_y or x_min > crop_x:
+                    continue
+                if y_max > crop_y and y_min < crop_y:
+                    y_min = crop_y
+                if x_max > crop_x and x_min < crop_x:
+                    x_max = crop_x
+
+            if i == 2: # bboxes[2] is for bottom-right area
+                if y_max < crop_y or x_max < crop_x:
+                    continue
+                if y_max > crop_y and y_min < crop_y:
+                    y_min = crop_y
+                if x_max > crop_x and x_min < crop_x:
+                    x_min = crop_x
+
+            if i == 3: # bboxes[3] is for top-right area
+                if y_min > crop_y or x_max < crop_x:
+                    continue
+                if y_max > crop_y and y_min < crop_y:
+                    y_max = crop_y
+                if x_max > crop_x and x_min < crop_x:
+                    x_min = crop_x
+
+            if abs(x_max-x_min) < max(10, width*0.01) or abs(y_max-y_min) < max(10, height*0.01):
+                #if the adjusted bbox is too small, bypass it
+                continue
+
+            merge_bbox.append([x_min, y_min, x_max, y_max, box[4]])
+
+    if len(merge_bbox) > max_boxes:
+        merge_bbox = merge_bbox[:max_boxes]
+
+    box_data = np.zeros((max_boxes,5))
+    if len(merge_bbox) > 0:
+        box_data[:len(merge_bbox)] = merge_bbox
+    return box_data
+
+
+def random_mosaic_augment(image_data, boxes_data, prob=.1):
+    """
+    Random add mosaic augment on batch images and boxes, from YOLOv4
+
+    reference:
+        https://github.com/klauspa/Yolov4-tensorflow/blob/master/data.py
+        https://github.com/clovaai/CutMix-PyTorch
+        https://github.com/AlexeyAB/darknet
+
+    # Arguments
+        image_data: origin images for mosaic augment
+            numpy array for normalized batch image data
+        boxes_data: origin bboxes for mosaic augment
+            numpy array for batch bboxes
+        prob: probability for augment ,
+            scalar to control the augment probability.
+
+    # Returns
+        image_data: augmented batch image data.
+        boxes_data: augmented batch bboxes data.
+    """
+    do_augment = rand() < prob
+    if not do_augment:
+        return image_data, boxes_data
+    else:
+        batch_size = len(image_data)
+        assert batch_size >= 4, 'mosaic augment need batch size >= 4'
+
+        def get_mosaic_samples():
+            # random select 4 images from batch as mosaic samples
+            random_index = random.sample(list(range(batch_size)), 4)
+
+            random_images = []
+            random_bboxes = []
+            for idx in random_index:
+                random_images.append(image_data[idx])
+                random_bboxes.append(boxes_data[idx])
+            return random_images, np.array(random_bboxes)
+
+        min_offset = 0.2
+        new_images = []
+        new_boxes = []
+        height, width = image_data[0].shape[:2]
+        #each batch has batch_size images, so we also need to
+        #generate batch_size mosaic images
+        for i in range(batch_size):
+            images, bboxes = get_mosaic_samples()
+
+            #crop_x = np.random.randint(int(width*min_offset), int(width*(1 - min_offset)))
+            #crop_y = np.random.randint(int(height*min_offset), int(height*(1 - min_offset)))
+            crop_x = int(random.uniform(int(width*min_offset), int(width*(1-min_offset))))
+            crop_y = int(random.uniform(int(height*min_offset), int(height*(1 - min_offset))))
+
+            merged_boxes = merge_mosaic_bboxes(bboxes, crop_x, crop_y, image_size=(height, width))
+            #no valid bboxes, drop this loop
+            #if merged_boxes is None:
+                #i = i - 1
+                #continue
+
+            # crop out selected area as following mosaic sample images order:
+            # -----------
+            # |     |   |
+            # |  0  | 3 |
+            # |     |   |
+            # -----------
+            # |  1  | 2 |
+            # -----------
+            area_0 = images[0][:crop_y, :crop_x, :]
+            area_1 = images[1][crop_y:, :crop_x, :]
+            area_2 = images[2][crop_y:, crop_x:, :]
+            area_3 = images[3][:crop_y, crop_x:, :]
+
+            #merge selected area to new image
+            area_left = np.concatenate([area_0, area_1], axis=0)
+            area_right = np.concatenate([area_3, area_2], axis=0)
+            merged_image = np.concatenate([area_left, area_right], axis=1)
+
+            new_images.append(merged_image)
+            new_boxes.append(merged_boxes)
+
+        new_images = np.stack(new_images)
+        new_boxes = np.array(new_boxes)
+        return new_images, new_boxes
+
+
+def merge_cutmix_bboxes(bboxes, cut_xmin, cut_ymin, cut_xmax, cut_ymax, image_size):
+    # adjust & merge cutmix samples bboxes as following area order:
+    # -----------------
+    # |               |
+    # |  0            |
+    # |       ____    |
+    # |      |    |   |
+    # |      |  1 |   |
+    # |      |____|   |
+    # |               |
+    # -----------------
+    assert bboxes.shape[0] == 2, 'cutmix sample number should be 2'
+    max_boxes = bboxes.shape[1]
+    height, width = image_size
+    merge_bbox = []
+    for i in range(bboxes.shape[0]):
+        for box in bboxes[i]:
+            x_min, y_min, x_max, y_max = box[0], box[1], box[2], box[3]
+
+            if i == 0: # bboxes[0] is for background area
+                if x_min > cut_xmin and x_max < cut_xmax and y_min > cut_ymin and y_max < cut_ymax:
+                    # all box in padding area, drop it
+                    continue
+                elif x_min > cut_xmax or x_max < cut_xmin or y_min > cut_ymax or y_max < cut_ymin:
+                    # all box in background area, do nothing
+                    pass
+                else:
+                    # TODO: currently it is a BAD strategy to adjust box in background area, so seems
+                    # CutMix could not be used directly in object detection data augment
+                    if x_max > cut_xmin and x_max < cut_xmax:
+                        x_max = cut_xmin
+                    elif x_min > cut_xmin and x_min < cut_xmax:
+                        x_min = cut_xmax
+                    if y_max > cut_ymin and y_max < cut_ymax:
+                        y_max = cut_ymin
+                    elif y_min > cut_ymin and y_min < cut_ymax:
+                        y_min = cut_ymax
+
+            if i == 1: # bboxes[1] is for padding area
+                if x_min > cut_xmin and x_max < cut_xmax and y_min > cut_ymin and y_max < cut_ymax :
+                    # all box in padding area, do nothing
+                    pass
+                elif x_min > cut_xmax or x_max < cut_xmin or y_min > cut_ymax or y_max < cut_ymin:
+                    # all box in background area, drop it
+                    continue
+                else:
+                    # limit box in padding area
+                    if x_max > cut_xmax:
+                        x_max = cut_xmax
+                    if x_min < cut_xmin:
+                        x_min = cut_xmin
+                    if y_max > cut_ymax:
+                        y_max = cut_ymax
+                    if y_min < cut_ymin:
+                        y_min = cut_ymin
+
+            if abs(x_max-x_min) < max(10, width*0.01) or abs(y_max-y_min) < max(10, height*0.01):
+                #if the adjusted bbox is too small, bypass it
+                continue
+
+            merge_bbox.append([x_min, y_min, x_max, y_max, box[4]])
+
+    if len(merge_bbox) > max_boxes:
+        merge_bbox = merge_bbox[:max_boxes]
+
+    box_data = np.zeros((max_boxes,5))
+    if len(merge_bbox) > 0:
+        box_data[:len(merge_bbox)] = merge_bbox
+    return box_data
+
+
+def random_cutmix_augment(image_data, boxes_data, prob=.1):
+    """
+    Random add cutmix augment on batch images and boxes
+
+    Warning: currently it is a BAD strategy and could not be used in object detection data augment
+
+    # Arguments
+        image_data: origin images for cutmix augment
+            numpy array for normalized batch image data
+        boxes_data: origin bboxes for cutmix augment
+            numpy array for batch bboxes
+        prob: probability for augment,
+            scalar to control the augment probability.
+
+    # Returns
+        image_data: augmented batch image data.
+        boxes_data: augmented batch bboxes data.
+    """
+    do_augment = rand() < prob
+    if not do_augment:
+        return image_data, boxes_data
+    else:
+        batch_size = len(image_data)
+        assert batch_size >= 2, 'cutmix augment need batch size >= 2'
+
+        def get_cutmix_samples():
+            # random select 2 images from batch as cutmix samples
+            random_index = random.sample(list(range(batch_size)), 2)
+
+            random_images = []
+            random_bboxes = []
+            for idx in random_index:
+                random_images.append(image_data[idx])
+                random_bboxes.append(boxes_data[idx])
+            return random_images, np.array(random_bboxes)
+
+        def get_cutmix_box(image_size, lamda):
+            height, width = image_size
+            min_offset = 0.1
+
+            # get width and height for cut area
+            cut_rat = np.sqrt(1. - lamda)
+            cut_w = np.int(width * cut_rat)
+            cut_h = np.int(height * cut_rat)
+
+            # get center point for cut area
+            center_x = np.random.randint(width)
+            center_y = np.random.randint(height)
+
+            # limit cut area to allowed image size
+            cut_xmin = np.clip(center_x - cut_w // 2, int(width*min_offset), int(width*(1-min_offset)))
+            cut_ymin = np.clip(center_y - cut_h // 2, int(height*min_offset), int(height*(1-min_offset)))
+            cut_xmax = np.clip(center_x + cut_w // 2, int(width*min_offset), int(width*(1-min_offset)))
+            cut_ymax = np.clip(center_y + cut_h // 2, int(height*min_offset), int(height*(1-min_offset)))
+
+            return cut_xmin, cut_ymin, cut_xmax, cut_ymax
+
+        new_images = []
+        new_boxes = []
+        height, width = image_data[0].shape[:2]
+        #each batch has batch_size images, so we also need to
+        #generate batch_size mosaic images
+        for i in range(batch_size):
+            images, bboxes = get_cutmix_samples()
+            lamda = np.random.beta(5, 5)
+
+            cut_xmin, cut_ymin, cut_xmax, cut_ymax = get_cutmix_box(image_size=(height, width), lamda=lamda)
+            merged_boxes = merge_cutmix_bboxes(bboxes, cut_xmin, cut_ymin, cut_xmax, cut_ymax, image_size=(height, width))
+            #no valid bboxes, drop this loop
+            #if merged_boxes is None:
+                #i = i - 1
+                #continue
+
+            # crop and pad selected area as following cutmix sample images order:
+            # -----------------
+            # |               |
+            # |  0            |
+            # |       ____    |
+            # |      |    |   |
+            # |      |  1 |   |
+            # |      |____|   |
+            # |               |
+            # -----------------
+            bg_image = images[0].copy()
+            pad_image = images[1].copy()
+
+            #crop and pad selected area to background image
+            bg_image[cut_ymin:cut_ymax, cut_xmin:cut_xmax, :] = pad_image[cut_ymin:cut_ymax, cut_xmin:cut_xmax, :]
+            merged_image = bg_image
+
+            new_images.append(merged_image)
+            new_boxes.append(merged_boxes)
+
+        new_images = np.stack(new_images)
+        new_boxes = np.array(new_boxes)
+        return new_images, new_boxes
 
 
 def normalize_image(image):

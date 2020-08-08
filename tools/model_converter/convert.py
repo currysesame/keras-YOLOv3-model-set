@@ -1,4 +1,5 @@
-#! /usr/bin/env python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Reads Darknet config and weights and creates Keras model with TF backend.
 
@@ -7,20 +8,22 @@ Reads Darknet config and weights and creates Keras model with TF backend.
 import argparse
 import configparser
 import io
-import os
+import os, sys
 from collections import defaultdict
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras.layers import (Conv2D, Input, ZeroPadding2D, Add, Lambda,
-                          UpSampling2D, MaxPooling2D, Concatenate)
-from tensorflow.keras.layers import LeakyReLU
+                          UpSampling2D, MaxPooling2D, AveragePooling2D, Concatenate, Activation)
+from tensorflow.keras.layers import LeakyReLU, ReLU
 from tensorflow.keras.layers import BatchNormalization
 from tensorflow.keras.models import Model
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.utils import plot_model as plot
 
+sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..'))
+from yolo4.models.layers import mish
 
 parser = argparse.ArgumentParser(description='Darknet To Keras Converter.')
 parser.add_argument('config_path', help='Path to Darknet cfg file.')
@@ -36,6 +39,17 @@ parser.add_argument(
     '--weights_only',
     help='Save as Keras weights file instead of model file.',
     action='store_true')
+parser.add_argument(
+    '-f',
+    '--fixed_input_shape',
+    help='Use fixed input shape specified in cfg.',
+    action='store_true')
+parser.add_argument(
+    '-r',
+    '--yolo4_reorder',
+    help='Reorder output tensors for YOLOv4 cfg and weights file.',
+    action='store_true')
+
 
 def unique_config_sections(config_file):
     """Convert all config sections to have unique names.
@@ -85,13 +99,20 @@ def _main(args):
     cfg_parser = configparser.ConfigParser()
     cfg_parser.read_file(unique_config_file)
 
+    weight_decay = float(cfg_parser['net_0']['decay']) if 'net_0' in cfg_parser.sections() else 5e-4
+
+    # Parase model input width, height
+    width = int(cfg_parser['net_0']['width']) if 'net_0' in cfg_parser.sections() else None
+    height = int(cfg_parser['net_0']['height']) if 'net_0' in cfg_parser.sections() else None
+
     print('Creating Keras model.')
-    input_layer = Input(shape=(None, None, 3))
+    if width and height and args.fixed_input_shape:
+        input_layer = Input(shape=(height, width, 3), name='image_input')
+    else:
+        input_layer = Input(shape=(None, None, 3), name='image_input')
     prev_layer = input_layer
     all_layers = []
 
-    weight_decay = float(cfg_parser['net_0']['decay']
-                         ) if 'net_0' in cfg_parser.sections() else 5e-4
     count = 0
     out_index = []
     for section in cfg_parser.sections():
@@ -157,6 +178,10 @@ def _main(args):
             act_fn = None
             if activation == 'leaky':
                 pass  # Add advanced activation later.
+            elif activation == 'relu':
+                pass  # Add advanced activation later.
+            elif activation == 'mish':
+                pass  # Add advanced activation later.
             elif activation != 'linear':
                 raise ValueError(
                     'Unknown activation function `{}` in section {}'.format(
@@ -182,8 +207,16 @@ def _main(args):
 
             if activation == 'linear':
                 all_layers.append(prev_layer)
+            elif activation == 'mish':
+                act_layer = Activation(mish)(prev_layer)
+                prev_layer = act_layer
+                all_layers.append(act_layer)
             elif activation == 'leaky':
                 act_layer = LeakyReLU(alpha=0.1)(prev_layer)
+                prev_layer = act_layer
+                all_layers.append(act_layer)
+            elif activation == 'relu':
+                act_layer = ReLU()(prev_layer)
                 prev_layer = act_layer
                 all_layers.append(act_layer)
 
@@ -210,6 +243,11 @@ def _main(args):
                     padding='same')(prev_layer))
             prev_layer = all_layers[-1]
 
+        elif section.startswith('avgpool'):
+            all_layers.append(
+                AveragePooling2D()(prev_layer))
+            prev_layer = all_layers[-1]
+
         elif section.startswith('shortcut'):
             index = int(cfg_parser[section]['from'])
             activation = cfg_parser[section]['activation']
@@ -219,7 +257,7 @@ def _main(args):
 
         elif section.startswith('upsample'):
             stride = int(cfg_parser[section]['stride'])
-            assert stride == 2, 'Only stride=2 supported.'
+            assert stride%2 == 0, 'upsample stride should be multiples of 2'
             all_layers.append(UpSampling2D(stride)(prev_layer))
             prev_layer = all_layers[-1]
 
@@ -253,6 +291,12 @@ def _main(args):
 
     # Create and save model.
     if len(out_index)==0: out_index.append(len(all_layers)-1)
+
+    if args.yolo4_reorder:
+        # reverse the output tensor index for YOLOv4 cfg & weights,
+        # since it use a different yolo outout order
+        out_index.reverse()
+
     model = Model(inputs=input_layer, outputs=[all_layers[i] for i in out_index])
     print(model.summary())
     if args.weights_only:

@@ -23,8 +23,8 @@ def yolo3_head(feats, anchors, num_classes, input_shape, calc_loss=False):
         feats, [-1, grid_shape[0], grid_shape[1], num_anchors, num_classes + 5])
 
     # Adjust preditions to each spatial grid point and anchor size.
-    box_xy = (K.sigmoid(feats[..., :2]) + grid) / K.cast(grid_shape[::-1], K.dtype(feats))
-    box_wh = K.exp(feats[..., 2:4]) * anchors_tensor / K.cast(input_shape[::-1], K.dtype(feats))
+    box_xy = (K.sigmoid(feats[..., :2]) + grid) / K.cast(grid_shape[..., ::-1], K.dtype(feats))
+    box_wh = K.exp(feats[..., 2:4]) * anchors_tensor / K.cast(input_shape[..., ::-1], K.dtype(feats))
     box_confidence = K.sigmoid(feats[..., 4:5])
     box_class_probs = K.sigmoid(feats[..., 5:])
 
@@ -37,9 +37,17 @@ def yolo3_correct_boxes(box_xy, box_wh, input_shape, image_shape):
     '''Get corrected boxes'''
     input_shape = K.cast(input_shape, K.dtype(box_xy))
     image_shape = K.cast(image_shape, K.dtype(box_xy))
+
+    #reshape the image_shape tensor to align with boxes dimension
+    image_shape = K.reshape(image_shape, [-1, 1, 1, 1, 2])
+
     new_shape = K.round(image_shape * K.min(input_shape/image_shape))
     offset = (input_shape-new_shape)/2./input_shape
     scale = input_shape/new_shape
+    # reverse offset/scale to match (w,h) order
+    offset = offset[..., ::-1]
+    scale = scale[..., ::-1]
+
     box_xy = (box_xy - offset) * scale
     box_wh *= scale
 
@@ -53,7 +61,8 @@ def yolo3_correct_boxes(box_xy, box_wh, input_shape, image_shape):
     ])
 
     # Scale boxes back to original image shape.
-    boxes *= K.concatenate([image_shape, image_shape])
+    image_wh = image_shape[..., ::-1]
+    boxes *= K.concatenate([image_wh, image_wh])
     return boxes
 
 

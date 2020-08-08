@@ -6,6 +6,8 @@
 //
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
 #include "MNN/ImageProcess.hpp"
 #include "MNN/Interpreter.hpp"
 #define MNN_OPEN_TIME_TRACE
@@ -49,12 +51,14 @@ struct Settings {
   int loop_count = 1;
   int number_of_threads = 4;
   int number_of_warmup_runs = 2;
+  float conf_thrd = 0.1f;
   float input_mean = 0.0f;
   float input_std = 255.0f;
   std::string model_name = "./model.mnn";
   std::string input_img_name = "./dog.jpg";
   std::string classes_file_name = "./classes.txt";
   std::string anchors_file_name = "./yolo3_anchors.txt";
+  std::string result_file_name = "./result.txt";
   bool input_floating = false;
   //bool verbose = false;
   //string input_layer_type = "uint8_t";
@@ -96,11 +100,13 @@ void display_usage() {
         << "--image, -i: image_name.jpg\n"
         << "--classes, -l: classes labels for the model\n"
         << "--anchors, -a: anchor values for the model\n"
+        << "--conf_thrd, -n: confidence threshold for detection filter\n"
         << "--input_mean, -b: input mean\n"
         << "--input_std, -s: input standard deviation\n"
         << "--threads, -t: number of threads\n"
         << "--count, -c: loop model run for certain times\n"
         << "--warmup_runs, -w: number of warmup runs\n"
+        << "--result, -r: result txt file to save detection output\n"
         //<< "--verbose, -v: [0|1] print more information\n"
         << "\n";
     return;
@@ -115,33 +121,20 @@ void yolo_postprocess(const Tensor* feature_map, const int input_width, const in
     // 1. do following transform to get the output bbox,
     //    which is aligned with YOLOv3/YOLOv2 paper:
     //
-    //    bbox_x = sigmoid(pred_x) + grid_w
-    //    bbox_y = sigmoid(pred_y) + grid_h
-    //    bbox_w = exp(pred_w) * anchor_w / stride
-    //    bbox_h = exp(pred_h) * anchor_h / stride
+    //    bbox_x = (sigmoid(pred_x) + grid_w) / grid_width
+    //    bbox_y = (sigmoid(pred_y) + grid_h) / grid_height
+    //    bbox_w = (exp(pred_w) * anchor_w) / input_width
+    //    bbox_h = (exp(pred_h) * anchor_h) / input_height
     //    bbox_obj = sigmoid(pred_obj)
     //
-    // 2. convert the grid scale coordinate back to
-    //    input image shape, with stride:
-    //
-    //    bbox_x = bbox_x * stride;
-    //    bbox_y = bbox_y * stride;
-    //    bbox_w = bbox_w * stride;
-    //    bbox_h = bbox_h * stride;
-    //
-    // 3. convert centoids to top left coordinates
-    //
-    //    bbox_x = bbox_x - (bbox_w / 2);
-    //    bbox_y = bbox_y - (bbox_h / 2);
-    //
-    // 4. get bbox confidence (class_score * objectness)
+    // 2. get bbox confidence (class_score * objectness)
     //    and filter with threshold
     //
     //    bbox_conf[:] = sigmoid/softmax(bbox_class_score[:]) * bbox_obj
     //    bbox_max_conf = max(bbox_conf[:])
     //    bbox_max_index = argmax(bbox_conf[:])
     //
-    // 5. filter bbox_max_conf with threshold
+    // 3. filter bbox_max_conf with threshold
     //
     //    if(bbox_max_conf > conf_threshold)
     //        enqueue the bbox info
@@ -226,21 +219,12 @@ void yolo_postprocess(const Tensor* feature_map, const int input_width, const in
                         exit(-1);
                     }
 
-                    float bbox_x = sigmoid(bytes[bbox_x_offset]) + w;
-                    float bbox_y = sigmoid(bytes[bbox_y_offset]) + h;
-                    float bbox_w = exp(bytes[bbox_w_offset]) * anchors[anc].first / stride;
-                    float bbox_h = exp(bytes[bbox_h_offset]) * anchors[anc].second / stride;
+                    // Decode YOLO predictions
+                    float bbox_x = (sigmoid(bytes[bbox_x_offset]) + w) / width;
+                    float bbox_y = (sigmoid(bytes[bbox_y_offset]) + h) / height;
+                    float bbox_w = exp(bytes[bbox_w_offset]) * anchors[anc].first / input_width;
+                    float bbox_h = exp(bytes[bbox_h_offset]) * anchors[anc].second / input_height;
                     float bbox_obj = sigmoid(bytes[bbox_obj_offset]);
-
-                    // Transfer anchor coordinates
-                    bbox_x = bbox_x * stride;
-                    bbox_y = bbox_y * stride;
-                    bbox_w = bbox_w * stride;
-                    bbox_h = bbox_h * stride;
-
-                    // Convert centoids to top left coordinates
-                    bbox_x = bbox_x - (bbox_w / 2);
-                    bbox_y = bbox_y - (bbox_h / 2);
 
                     // Get softmax score for YOLOv2 prediction
                     std::vector<float> logits_bbox_score;
@@ -523,30 +507,34 @@ void parse_anchors(std::string line, std::vector<std::pair<float, float>>& ancho
 }
 
 
-void adjust_boxes(std::vector<t_prediction> &prediction_nms_list, int image_width, int image_height, int input_width, int input_height)
+void adjust_boxes(std::vector<t_prediction> &prediction_list, int image_width, int image_height, int input_width, int input_height)
 {
-    // Rescale the final prediction (letterboxed) back to original image
-    MNN_ASSERT(input_width == input_height);
+    // Rescale the YOLO prediction (letterboxed) back to original image
+    float ratio = std::min(float(input_width)/float(image_width), float(input_height)/float(image_height));
 
-    int square_dim = std::max(image_width, image_height);
-    float scale = float(square_dim) / float(input_width);
-    int x_offset, y_offset;
+    float new_width = image_width * ratio;
+    float new_height = image_height * ratio;
 
-    if ( image_width > image_height ) {
-        x_offset = 0;
-        y_offset = floor((image_width - image_height) / 2);
-    }
-    else {
-        x_offset = floor((image_height - image_width) / 2);
-        y_offset = 0;
-    }
+    float x_offset = (input_width - new_width) / 2.0 / input_width;
+    float y_offset = (input_height - new_height) / 2.0 / input_height;
+    float scale_x = input_width / new_width;
+    float scale_y = input_height / new_height;
 
+    for(auto &prediction : prediction_list) {
+        prediction.x = (prediction.x - x_offset) * scale_x;
+        prediction.y = (prediction.y - y_offset) * scale_y;
+        prediction.width = prediction.width * scale_x;
+        prediction.height = prediction.height * scale_y;
 
-    for(auto &prediction_nms : prediction_nms_list) {
-        prediction_nms.x = prediction_nms.x * scale - x_offset;
-        prediction_nms.y = prediction_nms.y * scale - y_offset;
-        prediction_nms.width = prediction_nms.width * scale;
-        prediction_nms.height = prediction_nms.height * scale;
+        // Convert centoids to top left coordinates
+        prediction.x = prediction.x - (prediction.width / 2);
+        prediction.y = prediction.y - (prediction.height / 2);
+
+        // Scale boxes back to original image shape.
+        prediction.x = prediction.x * image_width;
+        prediction.y = prediction.y * image_height;
+        prediction.width = prediction.width * image_width;
+        prediction.height = prediction.height * image_height;
     }
 
     return;
@@ -554,63 +542,57 @@ void adjust_boxes(std::vector<t_prediction> &prediction_nms_list, int image_widt
 
 
 //Resize image with unchanged aspect ratio using padding
-uint8_t* letterbox_image(uint8_t* inputImage, int image_width, int image_height, int image_channel)
+uint8_t* letterbox_resize(uint8_t* inputImage, int image_width, int image_height, int image_channel, int input_width, int input_height, int input_channel)
 {
-    // if input image is square, just return original
-    if (image_width == image_height) {
-        return inputImage;
+    // assume the data channel match
+    MNN_ASSERT(image_channel == input_channel);
+
+    float scale = std::min(float(input_width)/float(image_width), float(input_height)/float(image_height));
+    int padding_width = int(image_width * scale);
+    int padding_height = int(image_height * scale);
+
+    int x_offset = int((input_width - padding_width) / 2);
+    int y_offset = int((input_height - padding_height) / 2);
+
+    uint8_t* padding_image = (uint8_t*)malloc(padding_height * padding_width * image_channel * sizeof(uint8_t));
+    if (padding_image == nullptr) {
+        MNN_PRINT("Can't alloc memory\n");
+        exit(-1);
     }
 
-    int square_dim = std::max(image_width, image_height);
-    int x_offset, y_offset;
+    stbir_resize_uint8(inputImage, image_width, image_height, 0,
+                     padding_image, padding_width, padding_height, 0, image_channel);
 
-    uint8_t* squareImage = (uint8_t*)malloc(square_dim * square_dim * image_channel * sizeof(uint8_t));
+    uint8_t* input_image = (uint8_t*)malloc(input_height * input_width * input_channel * sizeof(uint8_t));
+    // here we need to fulfill the input image to 128 first, to align with the training preprocess
+    memset((void*)input_image, 128, input_height * input_width * input_channel * sizeof(uint8_t));
 
-    if ( image_width > image_height ) {
-        x_offset = 0;
-        y_offset = floor((image_width - image_height) / 2);
-    }
-    else {
-        x_offset = floor((image_height - image_width) / 2);
-        y_offset = 0;
-    }
-
-    // paste input image into square image
-    for (int h = 0; h < image_height; h++) {
-        for (int w = 0; w < image_width; w++) {
+    // paste input image into letterbox image
+    for (int h = 0; h < padding_height; h++) {
+        for (int w = 0; w < padding_width; w++) {
             for (int c = 0; c < image_channel; c++) {
-                squareImage[(h+y_offset)*square_dim*image_channel + (w+x_offset)*image_channel + c] = inputImage[h*image_width*image_channel + w*image_channel + c];
+                input_image[(h+y_offset)*input_width*input_channel + (w+x_offset)*input_channel + c] = padding_image[h*padding_width*image_channel + w*image_channel + c];
             }
         }
     }
 
-    return squareImage;
+    free(padding_image);
+    return input_image;
 }
 
 
 template <class T>
-void resize(T* out, uint8_t* in, int image_width, int image_height,
-            int image_channels, int input_width, int input_height,
+void fill_data(T* out, uint8_t* in, int input_width, int input_height,
             int input_channels, Settings* s) {
-  uint8_t* resized = (uint8_t*)malloc(input_height * input_width * input_channels * sizeof(uint8_t));
-  if (resized == nullptr) {
-      MNN_PRINT("Can't alloc memory\n");
-      exit(-1);
-  }
-
-  stbir_resize_uint8(in, image_width, image_height, 0,
-                     resized, input_width, input_height, 0, input_channels);
-
   auto output_number_of_pixels = input_height * input_width * input_channels;
 
   for (int i = 0; i < output_number_of_pixels; i++) {
     if (s->input_floating)
-      out[i] = (resized[i] - s->input_mean) / s->input_std;
+      out[i] = (in[i] - s->input_mean) / s->input_std;
     else
-      out[i] = (uint8_t)resized[i];
+      out[i] = (uint8_t)in[i];
   }
 
-  free(resized);
   return;
 }
 
@@ -622,33 +604,36 @@ void RunInference(Settings* s) {
     // create model & session
     std::shared_ptr<Interpreter> net(Interpreter::createFromFile(s->model_name.c_str()));
     ScheduleConfig config;
-    config.type  = MNN_FORWARD_AUTO;
+    config.type  = MNN_FORWARD_AUTO; //MNN_FORWARD_CPU, MNN_FORWARD_OPENCL
+    config.backupType = MNN_FORWARD_CPU;
     config.numThread = s->number_of_threads;
+
+    BackendConfig bnconfig;
+    bnconfig.memory = BackendConfig::Memory_Normal; //Memory_High, Memory_Low
+    bnconfig.power = BackendConfig::Power_Normal; //Power_High, Power_Low
+    bnconfig.precision = BackendConfig::Precision_Normal; //Precision_High, Precision_Low
+    config.backendConfig = &bnconfig;
+
     auto session = net->createSession(config);
+    // since we don't need to create other sessions any more,
+    // just release model data to save memory
+    net->releaseModel();
 
     // get input tensor info
     // assume only 1 input tensor (image_input)
     auto inputs = net->getSessionInputAll(session);
     MNN_ASSERT(inputs.size() == 1);
     auto image_input = inputs.begin()->second;
-
-    auto shape = image_input->shape();
     int input_width = image_input->width();
     int input_height = image_input->height();
     int input_channel = image_input->channel();
-    if (input_channel == 0)
-        input_channel = 1;
-    if (input_height == 0)
-        input_height = 1;
-    if (input_width == 0)
-        input_width = 1;
     MNN_PRINT("image_input: width:%d , height:%d, channel: %d\n", input_width, input_height, input_channel);
-    // assume the model input is square
-    MNN_ASSERT(input_width == input_height);
 
-    shape[0] = 1;
-    net->resizeTensor(image_input, shape);
-    net->resizeSession(session);
+    //auto shape = image_input->shape();
+    //shape[0] = 1;
+    //net->resizeTensor(image_input, shape);
+    //net->resizeSession(session);
+
 
     // get output tensor info (e.g. for YOLOv3 arch):
     //image_input: 1 x 416 x 416 x 3
@@ -690,19 +675,12 @@ void RunInference(Settings* s) {
         return;
     }
 
-    // pad input image to letterboxed for input resize
-    uint8_t* letterboxImage = letterbox_image(inputImage, image_width, image_height, image_channel);
-    int square_dim = std::max(image_width, image_height);
-
-    std::vector<uint8_t> in(letterboxImage, letterboxImage + square_dim * square_dim * image_channel * sizeof(uint8_t));
+    // do letterbox resize to input image
+    uint8_t* letterboxImage = letterbox_resize(inputImage, image_width, image_height, image_channel, input_width, input_height, input_channel);
 
     // free input image
     stbi_image_free(inputImage);
-    if(letterboxImage != inputImage) {
-        free(letterboxImage);
-    }
     inputImage = nullptr;
-    letterboxImage = nullptr;
 
     MNN_PRINT("origin image size: width:%d, height:%d, channel:%d\n", image_width, image_height, image_channel);
 
@@ -713,9 +691,8 @@ void RunInference(Settings* s) {
     // run warm up session
     if (s->loop_count > 1)
         for (int i = 0; i < s->number_of_warmup_runs; i++) {
-            resize<float>(image_input->host<float>(), in.data(),
-                square_dim, square_dim, image_channel, input_width,
-                input_height, input_channel, s);
+            fill_data<float>(image_input->host<float>(), letterboxImage,
+                input_width, input_height, input_channel, s);
             if (net->runSession(session) != NO_ERROR) {
                 MNN_PRINT("Failed to invoke MNN!\n");
             }
@@ -724,9 +701,8 @@ void RunInference(Settings* s) {
     // run model sessions to get output
     gettimeofday(&start_time, nullptr);
     for (int i = 0; i < s->loop_count; i++) {
-        resize<float>(image_input->host<float>(), in.data(),
-            square_dim, square_dim, image_channel, input_width,
-            input_height, input_channel, s);
+        fill_data<float>(image_input->host<float>(), letterboxImage,
+            input_width, input_height, input_channel, s);
         if (net->runSession(session) != NO_ERROR) {
             MNN_PRINT("Failed to invoke MNN!\n");
         }
@@ -751,7 +727,7 @@ void RunInference(Settings* s) {
 
     // Do yolo_postprocess to parse out valid predictions
     std::vector<t_prediction> prediction_list;
-    float conf_threshold = 0.1;
+    float conf_threshold = s->conf_thrd;
     float iou_threshold = 0.4;
 
     gettimeofday(&start_time, nullptr);
@@ -769,6 +745,9 @@ void RunInference(Settings* s) {
     gettimeofday(&stop_time, nullptr);
     MNN_PRINT("yolo_postprocess time: %lf ms\n", (get_us(stop_time) - get_us(start_time)) / 1000);
 
+    // Rescale the prediction back to original image
+    adjust_boxes(prediction_list, image_width, image_height, input_width, input_height);
+
     // Do NMS for predictions
     std::vector<t_prediction> prediction_nms_list;
     gettimeofday(&start_time, nullptr);
@@ -776,15 +755,42 @@ void RunInference(Settings* s) {
     gettimeofday(&stop_time, nullptr);
     MNN_PRINT("NMS time: %lf ms\n", (get_us(stop_time) - get_us(start_time)) / 1000);
 
-    // Rescale the prediction back to original image
-    adjust_boxes(prediction_nms_list, image_width, image_height, input_width, input_height);
+    // Open result txt file, in append mode
+    std::ofstream resultOs (s->result_file_name.c_str(), std::ios::out | std::ios::app);
+    // Get real path for input image
+    char real_path_buff[PATH_MAX];
+    if(realpath(inputPath, real_path_buff)) {
+        resultOs << real_path_buff;
+    } else {
+        MNN_PRINT("fail to get image real path!\n");
+        exit(-1);
+    }
 
     // Show detection result
     MNN_PRINT("Detection result:\n");
     for(auto prediction_nms : prediction_nms_list) {
-        MNN_PRINT("%s %f (%d, %d) (%d, %d)\n", classes[prediction_nms.class_index].c_str(), prediction_nms.confidence, int(prediction_nms.x), int(prediction_nms.y), int(prediction_nms.x + prediction_nms.width), int(prediction_nms.y + prediction_nms.height));
-    }
+        // change box to (xmin,ymin,xmax,ymax) format
+        int x_min = std::max(0, int(prediction_nms.x));
+        int y_min = std::max(0, int(prediction_nms.y));
+        int x_max = std::min(image_width, int(prediction_nms.x + prediction_nms.width));
+        int y_max = std::min(image_height, int(prediction_nms.y + prediction_nms.height));
 
+        MNN_PRINT("%s %f (%d, %d) (%d, %d)\n", classes[prediction_nms.class_index].c_str(), prediction_nms.confidence, x_min, y_min, x_max, y_max);
+        // save detection result to file
+        resultOs << " "
+                 << x_min << ","
+                 << y_min << ","
+                 << x_max << ","
+                 << y_max << ","
+                 << prediction_nms.class_index << ","
+                 << prediction_nms.confidence;
+    }
+    resultOs << "\n";
+    resultOs.close();
+
+    // Release session and model
+    net->releaseSession(session);
+    //net->releaseModel();
     return;
 }
 
@@ -799,11 +805,13 @@ int main(int argc, char** argv) {
         {"image", required_argument, nullptr, 'i'},
         {"classes", required_argument, nullptr, 'l'},
         {"anchors", required_argument, nullptr, 'a'},
+        {"conf_thrd", required_argument, nullptr, 'n'},
         {"input_mean", required_argument, nullptr, 'b'},
         {"input_std", required_argument, nullptr, 's'},
         {"threads", required_argument, nullptr, 't'},
         {"count", required_argument, nullptr, 'c'},
         {"warmup_runs", required_argument, nullptr, 'w'},
+        {"result", required_argument, nullptr, 'r'},
         //{"verbose", required_argument, nullptr, 'v'},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}};
@@ -812,7 +820,7 @@ int main(int argc, char** argv) {
     int option_index = 0;
 
     c = getopt_long(argc, argv,
-                    "a:b:c:hi:l:m:s:t:w:", long_options,
+                    "a:b:c:hi:l:m:n:r:s:t:w:", long_options,
                     &option_index);
 
     /* Detect the end of the options. */
@@ -838,6 +846,9 @@ int main(int argc, char** argv) {
       case 'm':
         s.model_name = optarg;
         break;
+      case 'n':
+        s.conf_thrd = strtod(optarg, nullptr);
+        break;
       case 's':
         s.input_std = strtod(optarg, nullptr);
         break;
@@ -852,6 +863,9 @@ int main(int argc, char** argv) {
       case 'w':
         s.number_of_warmup_runs =
             strtol(optarg, nullptr, 10);  // NOLINT(runtime/deprecated_fn)
+        break;
+      case 'r':
+        s.result_file_name = optarg;
         break;
       case 'h':
       case '?':

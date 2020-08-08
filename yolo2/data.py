@@ -5,7 +5,7 @@ import numpy as np
 import random, math
 from PIL import Image
 from tensorflow.keras.utils import Sequence
-from common.data_utils import normalize_image, letterbox_resize, random_resize_crop_pad, reshape_boxes, random_hsv_distort, random_horizontal_flip, random_vertical_flip, random_grayscale, random_brightness, random_chroma, random_contrast, random_sharpness
+from common.data_utils import normalize_image, letterbox_resize, random_resize_crop_pad, reshape_boxes, random_hsv_distort, random_horizontal_flip, random_vertical_flip, random_grayscale, random_brightness, random_chroma, random_contrast, random_sharpness, random_blur, random_motion_blur, random_mosaic_augment
 from common.utils import get_multiscale_list
 
 
@@ -25,7 +25,7 @@ def transform_box_info(boxes, image_size):
     return boxes
 
 
-def get_ground_truth_data(annotation_line, input_shape, augment=True, max_boxes=20):
+def get_ground_truth_data(annotation_line, input_shape, augment=True, max_boxes=100):
     '''random preprocessing for real-time data augmentation'''
     line = annotation_line.split()
     image = Image.open(line[0])
@@ -71,6 +71,12 @@ def get_ground_truth_data(annotation_line, input_shape, augment=True, max_boxes=
 
     # random convert image to grayscale
     image = random_grayscale(image)
+
+    # random do normal blur to image
+    #image = random_blur(image)
+
+    # random do motion blur to image
+    #image = random_motion_blur(image, prob=0.2)
 
     # random vertical flip image
     image, vertical_flip = random_vertical_flip(image)
@@ -200,19 +206,23 @@ def get_y_true_data(box_data, anchors, input_shape, num_classes):
 
 
 class Yolo2DataGenerator(Sequence):
-    def __init__(self, annotation_lines, batch_size, input_shape, anchors, num_classes, rescale_interval=-1, shuffle=True):
+    def __init__(self, annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment=None, rescale_interval=-1, shuffle=True, **kwargs):
         self.annotation_lines = annotation_lines
         self.batch_size = batch_size
         self.input_shape = input_shape
         self.anchors = anchors
         self.num_classes = num_classes
+        self.enhance_augment = enhance_augment
         self.indexes = np.arange(len(self.annotation_lines))
         self.shuffle = shuffle
         # prepare multiscale config
         # TODO: error happens when using Sequence data generator with
         #       multiscale input shape, disable multiscale first
+        if rescale_interval != -1:
+            raise ValueError("tf.keras.Sequence generator doesn't support multiscale input, pls remove related config")
         #self.rescale_interval = rescale_interval
         self.rescale_interval = -1
+
         self.rescale_step = 0
         self.input_shape_list = get_multiscale_list()
 
@@ -240,6 +250,11 @@ class Yolo2DataGenerator(Sequence):
             box_data.append(box)
         image_data = np.array(image_data)
         box_data = np.array(box_data)
+
+        if self.enhance_augment == 'mosaic':
+            # add random mosaic augment on batch ground truth data
+            image_data, box_data = random_mosaic_augment(image_data, box_data, prob=0.2)
+
         y_true_data = get_y_true_data(box_data, self.anchors, self.input_shape, self.num_classes)
 
         return [image_data, y_true_data], np.zeros(self.batch_size)
@@ -250,7 +265,7 @@ class Yolo2DataGenerator(Sequence):
             np.random.shuffle(self.annotation_lines)
 
 
-def yolo2_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, rescale_interval):
+def yolo2_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment, rescale_interval):
     '''data generator for fit_generator'''
     n = len(annotation_lines)
     i = 0
@@ -275,13 +290,18 @@ def yolo2_data_generator(annotation_lines, batch_size, input_shape, anchors, num
             i = (i+1) % n
         image_data = np.array(image_data)
         box_data = np.array(box_data)
+
+        if enhance_augment == 'mosaic':
+            # add random mosaic augment on batch ground truth data
+            image_data, box_data = random_mosaic_augment(image_data, box_data, prob=0.2)
+
         y_true_data = get_y_true_data(box_data, anchors, input_shape, num_classes)
 
         yield [image_data, y_true_data], np.zeros(batch_size)
 
 
-def yolo2_data_generator_wrapper(annotation_lines, batch_size, input_shape, anchors, num_classes, rescale_interval=-1):
+def yolo2_data_generator_wrapper(annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment=None, rescale_interval=-1, **kwargs):
     n = len(annotation_lines)
     if n==0 or batch_size<=0: return None
-    return yolo2_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, rescale_interval)
+    return yolo2_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment, rescale_interval)
 

@@ -1,9 +1,9 @@
-## C++ on-device (X86/ARM) inference app for YOLOv3/v2 detection modelset
+## C++ on-device (X86/ARM) inference app for YOLOv4/v3/v2 detection modelset
 
-Here are some C++ implementation of the on-device inference for trained YOLOv3/v2 inference model, including forward propagation of the model, YOLO postprocess and bounding box NMS. Generally it should support YOLOv3/Tiny YOLOv3/YOLOv2 arch and all kinds of backbones & head. Now we have 2 approaches with different inference engine for that:
+Here are some C++ implementation of the on-device inference for trained YOLOv4/v3/v2 inference model, including forward propagation of the model, YOLO postprocess and bounding box NMS. Generally it should support all YOLOv4/v3/v2 related archs and all kinds of backbones & head. Now we have 2 approaches with different inference engine for that:
 
 * Tensorflow-Lite (verified on commit id: 1b8f5bc8011a1e85d7a110125c852a4f431d0f59)
-* [MNN](https://github.com/alibaba/MNN) from Alibaba (verified on release: [0.2.1.0](https://github.com/alibaba/MNN/releases/tag/0.2.1.0))
+* [MNN](https://github.com/alibaba/MNN) from Alibaba (verified on release: [1.0.0](https://github.com/alibaba/MNN/releases/tag/1.0.0))
 
 
 ### MNN
@@ -25,13 +25,19 @@ Refer to [MNN build guide](https://www.yuque.com/mnn/cn/build_linux), we need to
 # ./schema/generate.sh
 # ./tools/script/get_model.sh  # optional
 # mkdir build && cd build
-# cmake [-DCMAKE_TOOLCHAIN_FILE=<cross-compile toolchain file>] .. && make -j4
+# cmake [-DCMAKE_TOOLCHAIN_FILE=<cross-compile toolchain file>]
+        [-DMNN_BUILD_QUANTOOLS=ON -DMNN_BUILD_CONVERTER=ON -DMNN_BUILD_TRAIN=ON -MNN_BUILD_TRAIN_MINI=ON -MNN_USE_OPENCV=OFF] ..
+        && make -j4
 
-# cd ../tools/converter
-# ./generate_schema.sh
-# mkdir build && cd build && cmake .. && make -j4
+### MNN OpenCL backend build
+# apt install ocl-icd-opencl-dev
+# cmake [-DCMAKE_TOOLCHAIN_FILE=<cross-compile toolchain file>]
+        [-DMNN_OPENCL=ON -DMNN_SEP_BUILD=OFF -DMNN_USE_SYSTEM_LIB=ON] ..
+        && make -j4
 ```
 If you want to do cross compile for ARM platform, "CMAKE_TOOLCHAIN_FILE" should be specified
+"MNN_BUILD_QUANTOOLS" and "MNN_BUILD_CONVERTER" are for enabling MNN Quantization tool and MNN model converter
+"MNN_BUILD_TRAIN" related are for enabling MNN training tools
 
 
 2. Build demo inference application
@@ -63,7 +69,13 @@ Refer to [Model dump](https://github.com/david8862/keras-YOLOv3-model-set#model-
 * convert TF pb model to MNN model:
 
     ```
-    # mnnconvert -f TF --modelFile model.pb --MNNModel model.pb.mnn --bizCode biz
+    # cd <Path_to_MNN>/build/
+    # ./MNNConvert -f TF --modelFile model.pb --MNNModel model.pb.mnn --bizCode MNN
+    ```
+    or
+
+    ```
+    # mnnconvert -f TF --modelFile model.pb --MNNModel model.pb.mnn
     ```
 
 MNN support Post Training Integer quantization, so we can use its python CLI interface to do quantization on the generated .mnn model to get quantized .mnn model for ARM acceleration . A json config file [quantizeConfig.json](https://github.com/david8862/keras-YOLOv3-model-set/blob/master/inference/MNN/configs/quantizeConfig.json) is needed to describe the feeding data:
@@ -71,13 +83,19 @@ MNN support Post Training Integer quantization, so we can use its python CLI int
 * Quantized MNN model:
 
     ```
+    # cd <Path_to_MNN>/build/
+    # ./quantized.out model.pb.mnn model_quant.pb.mnn quantizeConfig.json
+    ```
+    or
+
+    ```
     # mnnquant model.pb.mnn model_quant.pb.mnn quantizeConfig.json
     ```
 
 4. Run validate script to check MNN model
 ```
-# cd keras-YOLOv3-model-set/tools/
-# python validate_yolo.py --model_path=model_quant.pb.mnn --anchors_path=../configs/tiny_yolo3_anchors.txt --classes_path=../configs/voc_classes.txt --image_file=../example/dog.jpg --loop_count=5
+# cd keras-YOLOv3-model-set/tools/evaluation/
+# python validate_yolo.py --model_path=model_quant.pb.mnn --anchors_path=../../configs/tiny_yolo3_anchors.txt --classes_path=../../configs/voc_classes.txt --image_file=../../example/dog.jpg --loop_count=5
 ```
 
 Visualized detection result:
@@ -98,14 +116,16 @@ Usage: yoloDetection
 --image, -i: image_name.jpg
 --classes, -l: classes labels for the model
 --anchors, -a: anchor values for the model
+--conf_thrd, -n: confidence threshold for detection filter
 --input_mean, -b: input mean
 --input_std, -s: input standard deviation
 --threads, -t: number of threads
 --count, -c: loop model run for certain times
 --warmup_runs, -w: number of warmup runs
+--result, -r: result txt file to save detection output
 
 
-# ./yoloDetection -m model.pb.mnn -i ../../../example/dog.jpg -l ../../../configs/voc_classes.txt -a ../../../configs/tiny_yolo3_anchors.txt -t 8 -c 10 -w 3
+# ./yoloDetection -m model.pb.mnn -i ../../../example/dog.jpg -l ../../../configs/voc_classes.txt -a ../../../configs/tiny_yolo3_anchors.txt -n 0.1 -t 8 -c 10 -w 3
 Can't Find type=4 backend, use 0 instead
 image_input: w:320 , h:320, bpp: 3
 num_classes: 20
@@ -155,7 +175,7 @@ If you want to do cross compile for ARM platform, "CMAKE_TOOLCHAIN_FILE" and "TA
 
 3. Convert trained YOLOv3/v2 model to tflite model
 
-Tensorflow-lite support both Float32 and UInt8 type model. We can dump out the keras .h5 model to Float32 .tflite model or use [post_train_quant_convert.py](https://github.com/david8862/keras-YOLOv3-model-set/blob/master/tools/post_train_quant_convert.py) script to convert to UInt8 model with TF 2.0 Post-training integer quantization tech, which could be smaller and faster on ARM:
+Tensorflow-lite support both Float32 and UInt8 type model. We can dump out the keras .h5 model to Float32 .tflite model or use [post_train_quant_convert.py](https://github.com/david8862/keras-YOLOv3-model-set/blob/master/tools/model_converter/post_train_quant_convert.py) script to convert to UInt8 model with TF 2.0 Post-training integer quantization tech, which could be smaller and faster on ARM:
 
 * dump out inference model from training checkpoint:
 
@@ -172,15 +192,15 @@ Tensorflow-lite support both Float32 and UInt8 type model. We can dump out the k
 * convert keras .h5 model to UInt8 tflite model with TF 2.0 Post-training integer quantization:
 
     ```
-    # cd keras-YOLOv3-model-set/tools
+    # cd keras-YOLOv3-model-set/tools/model_converter/
     # python post_train_quant_convert.py --keras_model_file=model.h5 --annotation_file=<train/test annotation file to feed converter> --model_input_shape=320x320 --sample_num=30 --output_file=model_quant.tflite
     ```
 
 
 4. Run validate script to check TFLite model
 ```
-# cd keras-YOLOv3-model-set/tools/
-# python validate_yolo.py --model_path=model.tflite --anchors_path=../configs/tiny_yolo3_anchors.txt --classes_path=../configs/voc_classes.txt --image_file=../example/dog.jpg --loop_count=5
+# cd keras-YOLOv3-model-set/tools/evaluation/
+# python validate_yolo.py --model_path=model.tflite --anchors_path=../../configs/tiny_yolo3_anchors.txt --classes_path=../../configs/voc_classes.txt --image_file=../../example/dog.jpg --loop_count=5
 ```
 #### You can also use [eval.py](https://github.com/david8862/keras-YOLOv3-model-set#evaluation) to do evaluation on the TFLite model
 
@@ -195,15 +215,17 @@ Usage: yoloDetection
 --image, -i: image_name.jpg
 --classes, -l: classes labels for the model
 --anchors, -a: anchor values for the model
+--conf_thrd, -n: confidence threshold for detection filter
 --input_mean, -b: input mean
 --input_std, -s: input standard deviation
 --allow_fp16, -f: [0|1], allow running fp32 models with fp16 or not
 --threads, -t: number of threads
 --count, -c: loop interpreter->Invoke() for certain times
 --warmup_runs, -w: number of warmup runs
+--result, -r: result txt file to save detection output
 --verbose, -v: [0|1] print more information
 
-# ./yoloDetection -m model.tflite -i ../../../example/dog.jpg -l ../../../configs/voc_classes.txt -a ../../../configs/tiny_yolo3_anchors.txt -t 8 -c 10 -w 3 -v 1
+# ./yoloDetection -m model.tflite -i ../../../example/dog.jpg -l ../../../configs/voc_classes.txt -a ../../../configs/tiny_yolo3_anchors.txt -n 0.1 -t 8 -c 10 -w 3 -v 1
 Loaded model model.tflite
 resolved reporter
 num_classes: 20
@@ -222,6 +244,18 @@ bicycle 0.838566 (144, 141) (549, 506)
 car 0.945672 (466, 79) (678, 173)
 dog 0.597517 (109, 215) (326, 519)
 ```
+
+### On-device evaluation
+
+1. Build your MNN/TFLite version "yoloDetection" application and put it on device together with [eval_inference.sh](https://github.com/david8862/keras-YOLOv3-model-set/blob/master/inference/eval_inference.sh). Then run the script to generate on-device inference result txt file for test images:
+
+```
+# ./eval_inference.sh
+Usage: ./eval_inference.sh <model_file> <image_path> <anchor_file> <class_file> <result_file> [conf_thrd=0.1]
+```
+
+2. Use independent evaluation tool [object_detection_eval.py](https://github.com/david8862/Object-Detection-Evaluation/blob/master/object_detection_eval.py) to get mAP from result txt.
+
 
 ### TODO
 - [ ] further latency optimize on yolo3 postprocess C++ implementation

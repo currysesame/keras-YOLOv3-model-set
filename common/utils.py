@@ -2,11 +2,16 @@
 # -*- coding=utf-8 -*-
 """Miscellaneous utility functions."""
 
-from PIL import Image
+import os
 import numpy as np
-import os, cv2, colorsys
+import time
+import cv2, colorsys
+from PIL import Image
 from matplotlib.colors import rgb_to_hsv, hsv_to_rgb
+
 from common.backbones.efficientnet import swish
+from common.backbones.mobilenet_v3 import hard_sigmoid, hard_swish
+from yolo4.models.layers import mish
 import tensorflow as tf
 
 
@@ -32,24 +37,19 @@ def optimize_tf_gpu(tf, K):
         K.set_session(session)
 
 
-def get_custom_objects(custom_objects_string):
+def get_custom_objects():
     '''
     form up a custom_objects dict so that the customized
     layer/function call could be correctly parsed when keras
     .h5 model is loading or converting
     '''
-    custom_objects_dict = {}
-    if custom_objects_string:
-        custom_object_names = custom_objects_string.split(',')
-        for custom_object_name in custom_object_names:
-            if custom_object_name == 'swish':
-                custom_objects_dict['swish'] = swish
-            elif custom_object_name == 'tf':
-                custom_objects_dict['tf'] = tf
-            else:
-                raise ValueError('unsupported custom objects: ', custom_object_name)
-    else:
-        custom_objects_dict = None
+    custom_objects_dict = {
+        'tf': tf,
+        'swish': swish,
+        'hard_sigmoid': hard_sigmoid,
+        'hard_swish': hard_swish,
+        'mish': mish
+    }
 
     return custom_objects_dict
 
@@ -58,11 +58,6 @@ def get_multiscale_list():
     input_shape_list = [(320,320), (352,352), (384,384), (416,416), (448,448), (480,480), (512,512), (544,544), (576,576), (608,608)]
 
     return input_shape_list
-
-
-def touchdir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
 
 
 def resize_anchors(base_anchors, target_shape, base_shape=(416,416)):
@@ -101,12 +96,15 @@ def get_colors(class_names):
     np.random.seed(None)  # Reset seed to default.
     return colors
 
-def get_dataset(annotation_file):
+def get_dataset(annotation_file, shuffle=True):
     with open(annotation_file) as f:
         lines = f.readlines()
-    np.random.seed(10101)
-    np.random.shuffle(lines)
-    np.random.seed(None)
+        lines = [line.strip() for line in lines]
+
+    if shuffle:
+        np.random.seed(int(time.time()))
+        np.random.shuffle(lines)
+        #np.random.seed(None)
 
     return lines
 

@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#! /usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Run a YOLOv3/YOLOv2 style detection model on test images.
@@ -22,19 +22,20 @@ from yolo3.postprocess_np import yolo3_postprocess_np
 from yolo2.model import get_yolo2_model, get_yolo2_inference_model
 from yolo2.postprocess_np import yolo2_postprocess_np
 from common.data_utils import preprocess_image
-from common.utils import get_classes, get_anchors, get_colors, draw_boxes, touchdir
-
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+from common.utils import get_classes, get_anchors, get_colors, draw_boxes
 from tensorflow.keras.utils import multi_gpu_model
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 #tf.enable_eager_execution()
 
 default_config = {
         "model_type": 'tiny_yolo3_darknet',
-        "weights_path": 'weights/yolov3-tiny.h5',
+        "weights_path": os.path.join('weights', 'yolov3-tiny.h5'),
         "pruning_model": False,
-        "anchors_path": 'configs/tiny_yolo3_anchors.txt',
-        "classes_path": 'configs/coco_classes.txt',
+        "anchors_path": os.path.join('configs', 'tiny_yolo3_anchors.txt'),
+        "classes_path": os.path.join('configs', 'coco_classes.txt'),
         "score" : 0.1,
         "iou" : 0.4,
         "model_image_size" : (416, 416),
@@ -103,7 +104,8 @@ class YOLO_np(object):
             assert self.model_image_size[1]%32 == 0, 'Multiples of 32 required'
 
         image_data = preprocess_image(image, self.model_image_size)
-        image_shape = image.size
+        #origin image shape, in (height, width) format
+        image_shape = tuple(reversed(image.size))
 
         start = time.time()
         out_boxes, out_classes, out_scores = self.predict(image_data, image_shape)
@@ -191,7 +193,9 @@ class YOLO(object):
             assert self.model_image_size[1]%32 == 0, 'Multiples of 32 required'
 
         image_data = preprocess_image(image, self.model_image_size)
-        image_shape = np.array([image.size[0], image.size[1]])
+
+        # prepare origin image shape, (height, width) format
+        image_shape = np.array([image.size[1], image.size[0]])
         image_shape = np.expand_dims(image_shape, 0)
 
         start = time.time()
@@ -210,7 +214,7 @@ class YOLO(object):
 
     def dump_saved_model(self, saved_model_path):
         model = self.inference_model
-        touchdir(saved_model_path)
+        os.makedirs(saved_model_path, exist_ok=True)
 
         tf.keras.experimental.export_saved_model(model, saved_model_path)
         print('export inference model to %s' % str(saved_model_path))
@@ -259,7 +263,7 @@ class YOLO(object):
 
     #def dump_saved_model(self, saved_model_path):
         #model = self.prenms_model
-        #touchdir(saved_model_path)
+        #os.makedirs(saved_model_path, exist_ok=True)
 
         #tf.keras.experimental.export_saved_model(model, saved_model_path)
         #print('export inference model to %s' % str(saved_model_path))
@@ -270,7 +274,13 @@ def detect_video(yolo, video_path, output_path=""):
     vid = cv2.VideoCapture(0 if video_path == '0' else video_path)
     if not vid.isOpened():
         raise IOError("Couldn't open webcam or video")
-    video_FourCC    = cv2.VideoWriter_fourcc(*'XVID') if video_path == '0' else int(vid.get(cv2.CAP_PROP_FOURCC))
+
+    # here we encode the video to MPEG-4 for better compatibility, you can use ffmpeg later
+    # to convert it to x264 to reduce file size:
+    # ffmpeg -i test.mp4 -vcodec libx264 -f mp4 test_264.mp4
+    #
+    #video_FourCC    = cv2.VideoWriter_fourcc(*'XVID') if video_path == '0' else int(vid.get(cv2.CAP_PROP_FOURCC))
+    video_FourCC    = cv2.VideoWriter_fourcc(*'XVID') if video_path == '0' else cv2.VideoWriter_fourcc(*"mp4v")
     video_fps       = vid.get(cv2.CAP_PROP_FPS)
     video_size      = (int(vid.get(cv2.CAP_PROP_FRAME_WIDTH)),
                         int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT)))
@@ -356,7 +366,7 @@ if __name__ == '__main__':
 
     parser.add_argument(
         '--model_image_size', type=str,
-        help='model image input size as <num>x<num>, default ' +
+        help='model image input size as <height>x<width>, default ' +
         str(YOLO.get_defaults("model_image_size")[0])+'x'+str(YOLO.get_defaults("model_image_size")[1]),
         default=str(YOLO.get_defaults("model_image_size")[0])+'x'+str(YOLO.get_defaults("model_image_size")[1])
     )
@@ -399,6 +409,7 @@ if __name__ == '__main__':
     if args.model_image_size:
         height, width = args.model_image_size.split('x')
         args.model_image_size = (int(height), int(width))
+        assert (args.model_image_size[0]%32 == 0 and args.model_image_size[1]%32 == 0), 'model_image_size should be multiples of 32'
 
     # get wrapped inference object
     yolo = YOLO_np(**vars(args))

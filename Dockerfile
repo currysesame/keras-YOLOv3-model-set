@@ -81,7 +81,7 @@ RUN ${PIP} --no-cache-dir install --upgrade \
     setuptools
 
 # Some TF tools expect a "python" binary
-RUN ln -s $(which ${PYTHON}) /usr/local/bin/python 
+RUN ln -s $(which ${PYTHON}) /usr/local/bin/python
 
 RUN apt-get update && apt-get install -y \
     iputils-ping \
@@ -93,6 +93,7 @@ RUN apt-get update && apt-get install -y \
     vim \
     cmake \
     imagemagick \
+    python3-opencv \
     openjdk-8-jdk \
     ${PYTHON}-dev \
     virtualenv \
@@ -117,6 +118,7 @@ RUN ${PIP} --no-cache-dir install \
     tensorflow-model-optimization \
     keras \
     mnn \
+    pycocotools \
     enum34
 
 # Change workdir

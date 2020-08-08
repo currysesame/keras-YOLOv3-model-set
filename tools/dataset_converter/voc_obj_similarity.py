@@ -14,10 +14,6 @@ classes = ["aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat"
 
 class_count = {}
 
-def touchdir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
-
 
 def get_classes(classes_path):
     '''loads the classes'''
@@ -34,7 +30,7 @@ def crop_bbox_image(image_name, bbox, count, class_name, output_path):
     cropImg = image[ymin:ymax, xmin:xmax]
 
     output_class_path = os.path.join(output_path, class_name)
-    touchdir(output_class_path)
+    os.makedirs(output_class_path, exist_ok=True)
     output_image_name = os.path.join(output_class_path, os.path.basename(image_name).split('.')[0] + '_' + class_name + '_' + str(count) + '.jpg')
     cv2.imwrite(output_image_name, cropImg)
 
@@ -200,7 +196,7 @@ def calc_image_similarity(img1_path,img2_path):
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset_path', type=str, help='path to PascalVOC dataset, default is ../VOCdevkit', default=getcwd()+'/../VOCdevkit')
+parser.add_argument('--dataset_path', type=str, help='path to PascalVOC dataset, default is ../../VOCdevkit', default=getcwd()+'/../../VOCdevkit')
 parser.add_argument('--output_path', type=str,  help='output path for croped image and similarity merge txt files, default is ./', default='./')
 parser.add_argument('--classes_path', type=str, required=False, help='path to class definitions')
 parser.add_argument('--similarity_threshold', type=int, required=False, help='threshold for similarity score', default=0.6)

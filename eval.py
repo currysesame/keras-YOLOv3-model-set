@@ -3,23 +3,28 @@
 """
 Calculate mAP for YOLO model on some annotation dataset
 """
+import os, argparse, time
 import numpy as np
-import random
-import os, argparse
-from yolo3.postprocess_np import yolo3_postprocess_np
-from yolo2.postprocess_np import yolo2_postprocess_np
-from common.data_utils import preprocess_image
-from common.utils import get_dataset, get_classes, get_anchors, get_colors, draw_boxes, touchdir, optimize_tf_gpu, get_custom_objects
-from PIL import Image
 import operator
+from operator import mul
+from functools import reduce
+from PIL import Image
+from collections import OrderedDict
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from tensorflow.keras.models import load_model
 import tensorflow.keras.backend as K
-
 import tensorflow as tf
 import MNN
+import onnxruntime
+
+from yolo3.postprocess_np import yolo3_postprocess_np
+from yolo2.postprocess_np import yolo2_postprocess_np
+from common.data_utils import preprocess_image
+from common.utils import get_dataset, get_classes, get_anchors, get_colors, draw_boxes, optimize_tf_gpu, get_custom_objects
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 optimize_tf_gpu(tf, K)
 
@@ -30,22 +35,22 @@ def annotation_parse(annotation_lines, class_names):
 
     image dict would be like:
     annotation_records = {
-        '000001.jpg': {'100,120,200,235':'dog', '85,63,156,128':'car', ...},
+        '/path/to/000001.jpg': {'100,120,200,235':'dog', '85,63,156,128':'car', ...},
         ...
     }
 
     ground truth class dict would be like:
     classes_records = {
         'car': [
-                ['00001.jpg','100,120,200,235'],
-                ['00002.jpg','85,63,156,128'],
+                ['000001.jpg','100,120,200,235'],
+                ['000002.jpg','85,63,156,128'],
                 ...
                ],
         ...
     }
     '''
-    annotation_records = {}
-    classes_records = {class_name: [] for class_name in class_names}
+    annotation_records = OrderedDict()
+    classes_records = OrderedDict({class_name: [] for class_name in class_names})
 
     for line in annotation_lines:
         box_records = {}
@@ -57,10 +62,11 @@ def annotation_parse(annotation_lines, class_names):
             coordinate = ','.join(box.split(',')[:-1])
             box_records[coordinate] = class_name
             #append or add ground truth class item
+            record = [os.path.basename(image_name), coordinate]
             if class_name in classes_records:
-                classes_records[class_name].append([image_name, coordinate])
+                classes_records[class_name].append(record)
             else:
-                classes_records[class_name] = list([[image_name, coordinate]])
+                classes_records[class_name] = list([record])
         annotation_records[image_name] = box_records
 
     return annotation_records, classes_records
@@ -108,7 +114,8 @@ def yolo_predict_tflite(interpreter, image, anchors, num_classes, conf_threshold
     model_image_size = (height, width)
 
     image_data = preprocess_image(image, model_image_size)
-    image_shape = image.size
+    #origin image shape, in (height, width) format
+    image_shape = tuple(reversed(image.size))
 
     interpreter.set_tensor(input_details[0]['index'], image_data)
     interpreter.invoke()
@@ -118,6 +125,7 @@ def yolo_predict_tflite(interpreter, image, anchors, num_classes, conf_threshold
         output_data = interpreter.get_tensor(output_detail['index'])
         prediction.append(output_data)
 
+    prediction.sort(key=lambda x: len(x[0]))
     if len(anchors) == 5:
         # YOLOv2 use 5 anchors and have only 1 prediction
         assert len(prediction) == 1, 'invalid YOLOv2 prediction number.'
@@ -129,18 +137,6 @@ def yolo_predict_tflite(interpreter, image, anchors, num_classes, conf_threshold
 
 
 def yolo_predict_mnn(interpreter, session, image, anchors, num_classes, conf_threshold):
-    # TODO: currently MNN python API only support getting input/output tensor by default or
-    # by name. so we need to hardcode the output tensor names here to get them from model
-    if len(anchors) == 6:
-        output_tensor_names = ['conv2d_1/Conv2D', 'conv2d_3/Conv2D']
-    elif len(anchors) == 9:
-        output_tensor_names = ['conv2d_3/Conv2D', 'conv2d_8/Conv2D', 'conv2d_13/Conv2D']
-    elif len(anchors) == 5:
-        # YOLOv2 use 5 anchors and have only 1 prediction
-        output_tensor_names = ['predict_conv/Conv2D']
-    else:
-        raise ValueError('invalid anchor number')
-
     # assume only 1 input tensor for image
     input_tensor = interpreter.getSessionInput(session)
     # get input shape
@@ -157,7 +153,8 @@ def yolo_predict_mnn(interpreter, session, image, anchors, num_classes, conf_thr
 
     # prepare input image
     image_data = preprocess_image(image, model_image_size)
-    image_shape = image.size
+    #origin image shape, in (height, width) format
+    image_shape = tuple(reversed(image.size))
 
     # use a temp tensor to copy data
     tmp_input = MNN.Tensor(input_shape, input_tensor.getDataType(),\
@@ -166,16 +163,63 @@ def yolo_predict_mnn(interpreter, session, image, anchors, num_classes, conf_thr
     input_tensor.copyFrom(tmp_input)
     interpreter.runSession(session)
 
+    def get_tensor_list(output_tensors):
+        # transform the output tensor dict to ordered tensor list, for further postprocess
+        #
+        # output tensor list should be like (for YOLOv3):
+        # [
+        #  (name, tensor) for (13, 13, 3, num_classes+5),
+        #  (name, tensor) for (26, 26, 3, num_classes+5),
+        #  (name, tensor) for (52, 52, 3, num_classes+5)
+        # ]
+        output_list = []
+
+        for (output_tensor_name, output_tensor) in output_tensors.items():
+            tensor_shape = output_tensor.getShape()
+            dim_type = output_tensor.getDimensionType()
+            tensor_height, tensor_width = tensor_shape[2:4] if dim_type == MNN.Tensor_DimensionType_Caffe else tensor_shape[1:3]
+
+            if len(anchors) == 6:
+                # Tiny YOLOv3
+                if tensor_height == height//32:
+                    output_list.insert(0, (output_tensor_name, output_tensor))
+                elif tensor_height == height//16:
+                    output_list.insert(1, (output_tensor_name, output_tensor))
+                else:
+                    raise ValueError('invalid tensor shape')
+            elif len(anchors) == 9:
+                # YOLOv3
+                if tensor_height == height//32:
+                    output_list.insert(0, (output_tensor_name, output_tensor))
+                elif tensor_height == height//16:
+                    output_list.insert(1, (output_tensor_name, output_tensor))
+                elif tensor_height == height//8:
+                    output_list.insert(2, (output_tensor_name, output_tensor))
+                else:
+                    raise ValueError('invalid tensor shape')
+            elif len(anchors) == 5:
+                # YOLOv2 use 5 anchors and have only 1 prediction
+                assert len(output_tensors) == 1, 'YOLOv2 model should have only 1 output tensor.'
+                output_list.insert(0, (output_tensor_name, output_tensor))
+            else:
+                raise ValueError('invalid anchor number')
+
+        return output_list
+
+    output_tensors = interpreter.getSessionOutputAll(session)
+    output_tensor_list = get_tensor_list(output_tensors)
+
     prediction = []
-    for output_tensor_name in output_tensor_names:
-        output_tensor = interpreter.getSessionOutput(session, output_tensor_name)
+    for (output_tensor_name, output_tensor) in output_tensor_list:
         output_shape = output_tensor.getShape()
+        output_elementsize = reduce(mul, output_shape)
 
         assert output_tensor.getDataType() == MNN.Halide_Type_Float
 
         # copy output tensor to host, for further postprocess
         tmp_output = MNN.Tensor(output_shape, output_tensor.getDataType(),\
-                    np.zeros(output_shape, dtype=float), output_tensor.getDimensionType())
+                    #np.zeros(output_shape, dtype=float), output_tensor.getDimensionType())
+                    tuple(np.zeros(output_shape, dtype=float).reshape(output_elementsize, -1)), output_tensor.getDimensionType())
 
         output_tensor.copyToHostTensor(tmp_output)
         #tmp_output.printTensorData()
@@ -190,6 +234,7 @@ def yolo_predict_mnn(interpreter, session, image, anchors, num_classes, conf_thr
 
         prediction.append(output_data)
 
+    prediction.sort(key=lambda x: len(x[0]))
     if len(anchors) == 5:
         # YOLOv2 use 5 anchors and have only 1 prediction
         assert len(prediction) == 1, 'invalid YOLOv2 prediction number.'
@@ -202,11 +247,11 @@ def yolo_predict_mnn(interpreter, session, image, anchors, num_classes, conf_thr
 
 def yolo_predict_pb(model, image, anchors, num_classes, model_image_size, conf_threshold):
     # NOTE: TF 1.x frozen pb graph need to specify input/output tensor name
-    # so we need to hardcode the input/output tensor names here to get them from model
+    # so we hardcode the input/output tensor names here to get them from model
     if len(anchors) == 6:
-        output_tensor_names = ['graph/conv2d_1/BiasAdd:0', 'graph/conv2d_3/BiasAdd:0']
+        output_tensor_names = ['graph/predict_conv_1/BiasAdd:0', 'graph/predict_conv_2/BiasAdd:0']
     elif len(anchors) == 9:
-        output_tensor_names = ['graph/conv2d_3/BiasAdd:0', 'graph/conv2d_8/BiasAdd:0', 'graph/conv2d_13/BiasAdd:0']
+        output_tensor_names = ['graph/predict_conv_1/BiasAdd:0', 'graph/predict_conv_2/BiasAdd:0', 'graph/predict_conv_3/BiasAdd:0']
     elif len(anchors) == 5:
         # YOLOv2 use 5 anchors and have only 1 prediction
         output_tensor_names = ['graph/predict_conv/BiasAdd:0']
@@ -216,19 +261,54 @@ def yolo_predict_pb(model, image, anchors, num_classes, model_image_size, conf_t
     # assume only 1 input tensor for image
     input_tensor_name = 'graph/image_input:0'
 
-    # prepare input image
-    image_data = preprocess_image(image, model_image_size)
-    image_shape = image.size
-
     # get input/output tensors
     image_input = model.get_tensor_by_name(input_tensor_name)
     output_tensors = [model.get_tensor_by_name(output_tensor_name) for output_tensor_name in output_tensor_names]
+
+    batch, height, width, channel = image_input.shape
+    model_image_size = (int(height), int(width))
+
+    # prepare input image
+    image_data = preprocess_image(image, model_image_size)
+    #origin image shape, in (height, width) format
+    image_shape = tuple(reversed(image.size))
 
     with tf.Session(graph=model) as sess:
         prediction = sess.run(output_tensors, feed_dict={
             image_input: image_data
         })
 
+    prediction.sort(key=lambda x: len(x[0]))
+    if len(anchors) == 5:
+        # YOLOv2 use 5 anchors and have only 1 prediction
+        assert len(prediction) == 1, 'invalid YOLOv2 prediction number.'
+        pred_boxes, pred_classes, pred_scores = yolo2_postprocess_np(prediction[0], image_shape, anchors, num_classes, model_image_size, max_boxes=100, confidence=conf_threshold)
+    else:
+        pred_boxes, pred_classes, pred_scores = yolo3_postprocess_np(prediction, image_shape, anchors, num_classes, model_image_size, max_boxes=100, confidence=conf_threshold)
+
+    return pred_boxes, pred_classes, pred_scores
+
+
+def yolo_predict_onnx(model, image, anchors, num_classes, conf_threshold):
+    input_tensors = []
+    for i, input_tensor in enumerate(model.get_inputs()):
+        input_tensors.append(input_tensor)
+
+    # assume only 1 input tensor for image
+    assert len(input_tensors) == 1, 'invalid input tensor number.'
+
+    batch, height, width, channel = input_tensors[0].shape
+    model_image_size = (height, width)
+
+    # prepare input image
+    image_data = preprocess_image(image, model_image_size)
+    #origin image shape, in (height, width) format
+    image_shape = tuple(reversed(image.size))
+
+    feed = {input_tensors[0].name: image_data}
+    prediction = model.run(None, feed)
+
+    prediction.sort(key=lambda x: len(x[0]))
     if len(anchors) == 5:
         # YOLOv2 use 5 anchors and have only 1 prediction
         assert len(prediction) == 1, 'invalid YOLOv2 prediction number.'
@@ -241,7 +321,8 @@ def yolo_predict_pb(model, image, anchors, num_classes, model_image_size, conf_t
 
 def yolo_predict_keras(model, image, anchors, num_classes, model_image_size, conf_threshold):
     image_data = preprocess_image(image, model_image_size)
-    image_shape = image.size
+    #origin image shape, in (height, width) format
+    image_shape = tuple(reversed(image.size))
 
     prediction = model.predict([image_data])
     if len(anchors) == 5:
@@ -261,8 +342,8 @@ def get_prediction_class_records(model, model_format, annotation_records, anchor
     sorted by score:
     pred_classes_records = {
         'car': [
-                ['00001.jpg','94,115,203,232',0.98],
-                ['00002.jpg','82,64,154,128',0.93],
+                ['000001.jpg','94,115,203,232',0.98],
+                ['000002.jpg','82,64,154,128',0.93],
                 ...
                ],
         ...
@@ -272,10 +353,20 @@ def get_prediction_class_records(model, model_format, annotation_records, anchor
         #MNN inference engine need create session
         session = model.createSession()
 
-    pred_classes_records = {}
+    # create txt file to save prediction result, with
+    # save format as annotation file but adding score, like:
+    #
+    # path/to/img1.jpg 50,100,150,200,0,0.86 30,50,200,120,3,0.95
+    #
+    os.makedirs('result', exist_ok=True)
+    result_file = open(os.path.join('result','detection_result.txt'), 'w')
+
+    pred_classes_records = OrderedDict()
     pbar = tqdm(total=len(annotation_records), desc='Eval model')
     for (image_name, gt_records) in annotation_records.items():
         image = Image.open(image_name)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
         image_array = np.array(image, dtype='uint8')
 
         # support of tflite model
@@ -287,6 +378,9 @@ def get_prediction_class_records(model, model_format, annotation_records, anchor
         # support of TF 1.x frozen pb model
         elif model_format == 'PB':
             pred_boxes, pred_classes, pred_scores = yolo_predict_pb(model, image, anchors, len(class_names), model_image_size, conf_threshold)
+        # support of ONNX model
+        elif model_format == 'ONNX':
+            pred_boxes, pred_classes, pred_scores = yolo_predict_onnx(model, image, anchors, len(class_names), conf_threshold)
         # normal keras h5 model
         elif model_format == 'H5':
             pred_boxes, pred_classes, pred_scores = yolo_predict_keras(model, image, anchors, len(class_names), model_image_size, conf_threshold)
@@ -296,12 +390,22 @@ def get_prediction_class_records(model, model_format, annotation_records, anchor
         #print('Found {} boxes for {}'.format(len(pred_boxes), image_name))
         pbar.update(1)
 
+        # save prediction result to txt
+        result_file.write(image_name)
+        for box, cls, score in zip(pred_boxes, pred_classes, pred_scores):
+            xmin, ymin, xmax, ymax = box
+            box_annotation = " %d,%d,%d,%d,%d,%f" % (
+                xmin, ymin, xmax, ymax, cls, score)
+            result_file.write(box_annotation)
+        result_file.write('\n')
+        result_file.flush()
+
         if save_result:
 
             gt_boxes, gt_classes, gt_scores = transform_gt_record(gt_records, class_names)
 
             result_dir=os.path.join('result','detection')
-            touchdir(result_dir)
+            os.makedirs(result_dir, exist_ok=True)
             colors = get_colors(class_names)
             image_array = draw_boxes(image_array, gt_boxes, gt_classes, gt_scores, class_names, colors=None, show_score=False)
             image_array = draw_boxes(image_array, pred_boxes, pred_classes, pred_scores, class_names, colors)
@@ -322,16 +426,18 @@ def get_prediction_class_records(model, model_format, annotation_records, anchor
             coordinate = "{},{},{},{}".format(xmin, ymin, xmax, ymax)
 
             #append or add predict class item
+            record = [os.path.basename(image_name), coordinate, score]
             if pred_class_name in pred_classes_records:
-                pred_classes_records[pred_class_name].append([image_name, coordinate, score])
+                pred_classes_records[pred_class_name].append(record)
             else:
-                pred_classes_records[pred_class_name] = list([[image_name, coordinate, score]])
+                pred_classes_records[pred_class_name] = list([record])
 
     # sort pred_classes_records for each class according to score
     for pred_class_list in pred_classes_records.values():
         pred_class_list.sort(key=lambda ele: ele[2], reverse=True)
 
     pbar.close()
+    result_file.close()
     return pred_classes_records
 
 
@@ -348,10 +454,13 @@ def box_iou(pred_box, gt_box):
     '''
     # get intersection box
     inter_box = [max(pred_box[0], gt_box[0]), max(pred_box[1], gt_box[1]), min(pred_box[2], gt_box[2]), min(pred_box[3], gt_box[3])]
+    inter_w = max(0.0, inter_box[2] - inter_box[0] + 1)
+    inter_h = max(0.0, inter_box[3] - inter_box[1] + 1)
+
     # compute overlap (IoU) = area of intersection / area of union
-    pred_area = (pred_box[2] - pred_box[0]) * (pred_box[3] - pred_box[1])
-    gt_area = (gt_box[2] - gt_box[0]) * (gt_box[3] - gt_box[1])
-    inter_area = (inter_box[2] - inter_box[0]) * (inter_box[3] - inter_box[1])
+    pred_area = (pred_box[2] - pred_box[0] + 1) * (pred_box[3] - pred_box[1] + 1)
+    gt_area = (gt_box[2] - gt_box[0] + 1) * (gt_box[3] - gt_box[1] + 1)
+    inter_area = inter_w * inter_h
     union_area = pred_area + gt_area - inter_area
     return 0 if union_area == 0 else float(inter_area) / float(union_area)
 
@@ -519,9 +628,55 @@ def draw_rec_prec(rec, prec, mrec, mprec, class_name, ap):
     #plt.show()
     # save the plot
     rec_prec_plot_path = os.path.join('result','classes')
-    touchdir(rec_prec_plot_path)
-    fig.savefig(os.path.join(rec_prec_plot_path, class_name + ".jpg"))
+    os.makedirs(rec_prec_plot_path, exist_ok=True)
+    fig.savefig(os.path.join(rec_prec_plot_path, class_name + ".png"))
     plt.cla() # clear axes for next plot
+
+
+import bokeh
+import bokeh.io as bokeh_io
+import bokeh.plotting as bokeh_plotting
+def generate_rec_prec_html(mrec, mprec, scores, class_name, ap):
+    """
+     generate dynamic P-R curve HTML page for each class
+    """
+    rec_prec_plot_path = os.path.join('result' ,'classes')
+    os.makedirs(rec_prec_plot_path, exist_ok=True)
+    bokeh_io.output_file(os.path.join(rec_prec_plot_path, class_name + '.html'), title='P-R curve for ' + class_name)
+
+    # prepare curve data
+    area_under_curve_x = mrec[:-1] + [mrec[-2]] + [mrec[-1]]
+    area_under_curve_y = mprec[:-1] + [0.0] + [mprec[-1]]
+    score_on_curve = [0.0] + scores[:-1] + [0.0] + [scores[-1]] + [1.0]
+    source = bokeh.models.ColumnDataSource(data={
+      'rec'      : area_under_curve_x,
+      'prec' : area_under_curve_y,
+      'score' : score_on_curve,
+    })
+
+    # prepare plot figure
+    plt_title = 'class: ' + class_name + ' AP = {}%'.format(ap*100)
+    plt = bokeh_plotting.figure(plot_height=200 ,plot_width=200, tools="", toolbar_location=None,
+               title=plt_title, sizing_mode="scale_width")
+    plt.background_fill_color = "#f5f5f5"
+    plt.grid.grid_line_color = "white"
+    plt.xaxis.axis_label = 'Recall'
+    plt.yaxis.axis_label = 'Precision'
+    plt.axis.axis_line_color = None
+
+    # draw curve data
+    plt.line(x='rec', y='prec', line_width=2, color='#ebbd5b', source=source)
+    plt.add_tools(bokeh.models.HoverTool(
+      tooltips=[
+        ( 'score', '@score{0.0000 a}'),
+      ],
+      formatters={
+        'rec'      : 'printf',
+        'prec' : 'printf',
+      },
+      mode='vline'
+    ))
+    bokeh_io.save(plt)
 
 
 def adjust_axes(r, t, fig, axes):
@@ -643,7 +798,7 @@ def calc_AP(gt_records, pred_records, class_name, iou_threshold, show_result):
                       ['image_file', 'xmin,ymin,xmax,ymax'],
                       ...
                      ]
-         pred_record: predict records for one class, with format:
+         pred_records: predict records for one class, with format (in score descending order):
                      [
                       ['image_file', 'xmin,ymin,xmax,ymax', score],
                       ['image_file', 'xmin,ymin,xmax,ymax', score],
@@ -654,6 +809,9 @@ def calc_AP(gt_records, pred_records, class_name, iou_threshold, show_result):
     '''
     # append usage flag in gt_records for matching gt search
     gt_records = [gt_record + ['unused'] for gt_record in gt_records]
+
+    # prepare score list for generating P-R html page
+    scores = [pred_record[2] for pred_record in pred_records]
 
     # init true_positive and false_positive list
     nd = len(pred_records)  # number of predict data
@@ -684,6 +842,7 @@ def calc_AP(gt_records, pred_records, class_name, iou_threshold, show_result):
     ap, mrec, mprec = voc_ap(rec, prec)
     if show_result:
         draw_rec_prec(rec, prec, mrec, mprec, class_name, ap)
+        generate_rec_prec_html(mrec, mprec, scores, class_name, ap)
 
     return ap, true_positive_count
 
@@ -698,7 +857,7 @@ def plot_Pascal_AP_result(count_images, count_true_positives, num_classes,
     window_title = "Ground-Truth Info"
     plot_title = "Ground-Truth\n" + "(" + str(count_images) + " files and " + str(num_classes) + " classes)"
     x_label = "Number of objects per class"
-    output_path = os.path.join('result','Ground-Truth_Info.jpg')
+    output_path = os.path.join('result','Ground-Truth_Info.png')
     draw_plot_func(gt_counter_per_class, num_classes, window_title, plot_title, x_label, output_path, to_show=False, plot_color='forestgreen', true_p_bar='')
 
     '''
@@ -711,7 +870,7 @@ def plot_Pascal_AP_result(count_images, count_true_positives, num_classes,
     plot_title += str(count_non_zero_values_in_dictionary) + " detected classes)"
     # end Plot title
     x_label = "Number of objects per class"
-    output_path = os.path.join('result','Predicted_Objects_Info.jpg')
+    output_path = os.path.join('result','Predicted_Objects_Info.png')
     draw_plot_func(pred_counter_per_class, len(pred_counter_per_class), window_title, plot_title, x_label, output_path, to_show=False, plot_color='forestgreen', true_p_bar=count_true_positives)
 
     '''
@@ -720,7 +879,7 @@ def plot_Pascal_AP_result(count_images, count_true_positives, num_classes,
     window_title = "mAP"
     plot_title = "mAP@IoU={0}: {1:.2f}%".format(iou_threshold, mAP)
     x_label = "Average Precision"
-    output_path = os.path.join('result','mAP.jpg')
+    output_path = os.path.join('result','mAP.png')
     draw_plot_func(APs, num_classes, window_title, plot_title, x_label, output_path, to_show=False, plot_color='royalblue', true_p_bar='')
 
     '''
@@ -729,7 +888,7 @@ def plot_Pascal_AP_result(count_images, count_true_positives, num_classes,
     window_title = "Precision"
     plot_title = "mPrec@IoU={0}: {1:.2f}%".format(iou_threshold, mPrec)
     x_label = "Precision rate"
-    output_path = os.path.join('result','Precision.jpg')
+    output_path = os.path.join('result','Precision.png')
     draw_plot_func(precision_dict, len(precision_dict), window_title, plot_title, x_label, output_path, to_show=False, plot_color='royalblue', true_p_bar='')
 
     '''
@@ -738,8 +897,42 @@ def plot_Pascal_AP_result(count_images, count_true_positives, num_classes,
     window_title = "Recall"
     plot_title = "mRec@IoU={0}: {1:.2f}%".format(iou_threshold, mRec)
     x_label = "Recall rate"
-    output_path = os.path.join('result','Recall.jpg')
+    output_path = os.path.join('result','Recall.png')
     draw_plot_func(recall_dict, len(recall_dict), window_title, plot_title, x_label, output_path, to_show=False, plot_color='royalblue', true_p_bar='')
+
+
+def get_mean_metric(metric_records, gt_classes_records):
+    '''
+    Calculate mean metric, but only count classes which have ground truth object
+
+    Param
+        metric_records: metric dict like:
+            metric_records = {
+                'aeroplane': 0.79,
+                'bicycle': 0.79,
+                    ...
+                'tvmonitor': 0.71,
+            }
+        gt_classes_records: ground truth class dict like:
+            gt_classes_records = {
+                'car': [
+                    ['000001.jpg','100,120,200,235'],
+                    ['000002.jpg','85,63,156,128'],
+                    ...
+                    ],
+                ...
+            }
+    Return
+         mean_metric: float value of mean metric
+    '''
+    mean_metric = 0.0
+    count = 0
+    for (class_name, metric) in metric_records.items():
+        if (class_name in gt_classes_records) and (len(gt_classes_records[class_name]) != 0):
+            mean_metric += metric
+            count += 1
+    mean_metric = (mean_metric/count)*100 if count != 0 else 0.0
+    return mean_metric
 
 
 def compute_mAP_PascalVOC(annotation_records, gt_classes_records, pred_classes_records, class_names, iou_threshold, show_result=True):
@@ -764,8 +957,12 @@ def compute_mAP_PascalVOC(annotation_records, gt_classes_records, pred_classes_r
         APs[class_name] = ap
         count_true_positives[class_name] = true_positive_count
 
+    #sort AP result by value, in descending order
+    APs = OrderedDict(sorted(APs.items(), key=operator.itemgetter(1), reverse=True))
+
     #get mAP percentage value
-    mAP = np.mean(list(APs.values()))*100
+    #mAP = np.mean(list(APs.values()))*100
+    mAP = get_mean_metric(APs, gt_classes_records)
 
     #get GroundTruth count per class
     gt_counter_per_class = {}
@@ -793,8 +990,10 @@ def compute_mAP_PascalVOC(annotation_records, gt_classes_records, pred_classes_r
             recall_dict[class_name] = float(count_true_positives[class_name]) / gt_count
 
     #get mPrec, mRec
-    mPrec = np.mean(list(precision_dict.values()))*100
-    mRec = np.mean(list(recall_dict.values()))*100
+    #mPrec = np.mean(list(precision_dict.values()))*100
+    #mRec = np.mean(list(recall_dict.values()))*100
+    mPrec = get_mean_metric(precision_dict, gt_classes_records)
+    mRec = get_mean_metric(recall_dict, gt_classes_records)
 
 
     if show_result:
@@ -811,7 +1010,7 @@ def compute_mAP_PascalVOC(annotation_records, gt_classes_records, pred_classes_r
         print('mRec@IoU=%.2f result: %f' % (iou_threshold, mRec))
 
     #return mAP percentage value
-    return mAP
+    return mAP, APs
 
 
 
@@ -819,12 +1018,19 @@ def compute_AP_COCO(annotation_records, gt_classes_records, pred_classes_records
     '''
     Compute MSCOCO AP list on AP 0.5:0.05:0.95
     '''
-    iou_threshold_list = np.arange(0.50,0.95,0.05)
+    iou_threshold_list = np.arange(0.50, 1.00, 0.05)
     APs = {}
+    pbar = tqdm(total=len(iou_threshold_list), desc='Eval COCO')
     for iou_threshold in iou_threshold_list:
         iou_threshold = round(iou_threshold, 2)
-        mAP = compute_mAP_PascalVOC(annotation_records, gt_classes_records, pred_classes_records, class_names, iou_threshold, show_result=False)
+        mAP, _ = compute_mAP_PascalVOC(annotation_records, gt_classes_records, pred_classes_records, class_names, iou_threshold, show_result=False)
         APs[iou_threshold] = round(mAP, 6)
+        pbar.update(1)
+
+    pbar.close()
+
+    #sort AP result by value, in descending order
+    APs = OrderedDict(sorted(APs.items(), key=operator.itemgetter(1), reverse=True))
 
     #get overall AP percentage value
     AP = np.mean(list(APs.values()))
@@ -833,11 +1039,11 @@ def compute_AP_COCO(annotation_records, gt_classes_records, pred_classes_records
         '''
          Draw MS COCO AP plot
         '''
-        touchdir('result')
+        os.makedirs('result', exist_ok=True)
         window_title = "MSCOCO AP on different IOU"
         plot_title = "COCO AP = {0:.2f}%".format(AP)
         x_label = "Average Precision"
-        output_path = os.path.join('result','COCO_AP.jpg')
+        output_path = os.path.join('result','COCO_AP.png')
         draw_plot_func(APs, len(APs), window_title, plot_title, x_label, output_path, to_show=False, plot_color='royalblue', true_p_bar='')
 
         print('\nMS COCO AP evaluation')
@@ -846,7 +1052,7 @@ def compute_AP_COCO(annotation_records, gt_classes_records, pred_classes_records
         print('total AP: %f' % (AP))
 
     #return AP percentage value
-    return AP
+    return AP, APs
 
 
 def compute_AP_COCO_Scale(annotation_records, scale_gt_classes_records, pred_classes_records, class_names):
@@ -856,7 +1062,7 @@ def compute_AP_COCO_Scale(annotation_records, scale_gt_classes_records, pred_cla
     scale_APs = {}
     for scale_key in ['small','medium','large']:
         gt_classes_records = scale_gt_classes_records[scale_key]
-        scale_AP = compute_AP_COCO(annotation_records, gt_classes_records, pred_classes_records, class_names, show_result=False)
+        scale_AP, _ = compute_AP_COCO(annotation_records, gt_classes_records, pred_classes_records, class_names, show_result=False)
         scale_APs[scale_key] = round(scale_AP, 4)
 
     #get overall AP percentage value
@@ -865,11 +1071,11 @@ def compute_AP_COCO_Scale(annotation_records, scale_gt_classes_records, pred_cla
     '''
      Draw Scale AP plot
     '''
-    touchdir('result')
+    os.makedirs('result', exist_ok=True)
     window_title = "MSCOCO AP on different scale"
     plot_title = "scale mAP = {0:.2f}%".format(scale_mAP)
     x_label = "Average Precision"
-    output_path = os.path.join('result','COCO_scale_AP.jpg')
+    output_path = os.path.join('result','COCO_scale_AP.png')
     draw_plot_func(scale_APs, len(scale_APs), window_title, plot_title, x_label, output_path, to_show=False, plot_color='royalblue', true_p_bar='')
 
     '''
@@ -888,7 +1094,7 @@ def compute_AP_COCO_Scale(annotation_records, scale_gt_classes_records, pred_cla
         window_title = "{} object number".format(scale_key)
         plot_title = "total {} object number = {}".format(scale_key, total_sum)
         x_label = "Object Number"
-        output_path = os.path.join('result','{}_object_number.jpg'.format(scale_key))
+        output_path = os.path.join('result','{}_object_number.png'.format(scale_key))
         draw_plot_func(gt_classes_sum, len(gt_classes_sum), window_title, plot_title, x_label, output_path, to_show=False, plot_color='royalblue', true_p_bar='')
 
     print('\nMS COCO AP evaluation on different scale')
@@ -917,8 +1123,8 @@ def get_scale_gt_dict(gt_classes_records, class_names):
     input gt_classes_records would be like:
     gt_classes_records = {
         'car': [
-                ['00001.jpg','100,120,200,235'],
-                ['00002.jpg','85,63,156,128'],
+                ['000001.jpg','100,120,200,235'],
+                ['000002.jpg','85,63,156,128'],
                 ...
                ],
         ...
@@ -927,8 +1133,8 @@ def get_scale_gt_dict(gt_classes_records, class_names):
         scale_gt_classes_records = {
             'small': {
                 'car': [
-                        ['00001.jpg','100,120,200,235'],
-                        ['00002.jpg','85,63,156,128'],
+                        ['000001.jpg','100,120,200,235'],
+                        ['000002.jpg','85,63,156,128'],
                         ...
                        ],
                 ...
@@ -936,8 +1142,8 @@ def get_scale_gt_dict(gt_classes_records, class_names):
 
             'medium': {
                 'car': [
-                        ['00003.jpg','100,120,200,235'],
-                        ['00004.jpg','85,63,156,128'],
+                        ['000003.jpg','100,120,200,235'],
+                        ['000004.jpg','85,63,156,128'],
                         ...
                        ],
                 ...
@@ -945,8 +1151,8 @@ def get_scale_gt_dict(gt_classes_records, class_names):
 
             'large': {
                 'car': [
-                        ['00005.jpg','100,120,200,235'],
-                        ['00006.jpg','85,63,156,128'],
+                        ['000005.jpg','100,120,200,235'],
+                        ['000006.jpg','85,63,156,128'],
                         ...
                        ],
                 ...
@@ -992,9 +1198,9 @@ def eval_AP(model, model_format, annotation_lines, anchors, class_names, model_i
     AP = 0.0
 
     if eval_type == 'VOC':
-        AP = compute_mAP_PascalVOC(annotation_records, gt_classes_records, pred_classes_records, class_names, iou_threshold)
+        AP, _ = compute_mAP_PascalVOC(annotation_records, gt_classes_records, pred_classes_records, class_names, iou_threshold)
     elif eval_type == 'COCO':
-        AP = compute_AP_COCO(annotation_records, gt_classes_records, pred_classes_records, class_names)
+        AP, _ = compute_AP_COCO(annotation_records, gt_classes_records, pred_classes_records, class_names)
         # get AP for different scale: small, medium, large
         scale_gt_classes_records = get_scale_gt_dict(gt_classes_records, class_names)
         compute_AP_COCO_Scale(annotation_records, scale_gt_classes_records, pred_classes_records, class_names)
@@ -1024,8 +1230,7 @@ def load_graph(model_path):
     return graph
 
 
-def load_eval_model(model_path, custom_objects_string):
-
+def load_eval_model(model_path):
     # support of tflite model
     if model_path.endswith('.tflite'):
         from tensorflow.lite.python import interpreter as interpreter_wrapper
@@ -1043,9 +1248,14 @@ def load_eval_model(model_path, custom_objects_string):
         model = load_graph(model_path)
         model_format = 'PB'
 
+    # support of ONNX model
+    elif model_path.endswith('.onnx'):
+        model = onnxruntime.InferenceSession(model_path)
+        model_format = 'ONNX'
+
     # normal keras h5 model
     elif model_path.endswith('.h5'):
-        custom_object_dict = get_custom_objects(custom_objects_string)
+        custom_object_dict = get_custom_objects()
 
         model = load_model(model_path, compile=False, custom_objects=custom_object_dict)
         model_format = 'H5'
@@ -1058,7 +1268,7 @@ def load_eval_model(model_path, custom_objects_string):
 
 def main():
     # class YOLO defines the default value, so suppress any default here
-    parser = argparse.ArgumentParser(argument_default=argparse.SUPPRESS, description='evaluate YOLO model (h5/pb/tflite/mnn) with test dataset')
+    parser = argparse.ArgumentParser(argument_default=argparse.SUPPRESS, description='evaluate YOLO model (h5/pb/onnx/tflite/mnn) with test dataset')
     '''
     Command line options
     '''
@@ -1067,36 +1277,32 @@ def main():
         help='path to model file')
 
     parser.add_argument(
-        '--custom_objects', type=str, required=False, default=None,
-        help="Custom objects in keras model (swish/tf). Separated with comma if more than one.")
-
-    parser.add_argument(
         '--anchors_path', type=str, required=True,
         help='path to anchor definitions')
 
     parser.add_argument(
         '--classes_path', type=str, required=False,
-        help='path to class definitions, default configs/voc_classes.txt', default='configs/voc_classes.txt')
+        help='path to class definitions, default=%(default)s', default=os.path.join('configs' , 'voc_classes.txt'))
 
     parser.add_argument(
         '--annotation_file', type=str, required=True,
         help='test annotation txt file')
 
     parser.add_argument(
-        '--eval_type', type=str,
-        help='evaluation type (VOC/COCO), default=VOC', default='VOC')
+        '--eval_type', type=str, required=False, choices=['VOC', 'COCO'],
+        help='evaluation type (VOC/COCO), default=%(default)s', default='VOC')
 
     parser.add_argument(
         '--iou_threshold', type=float,
-        help='IOU threshold for PascalVOC mAP, default=0.5', default=0.5)
+        help='IOU threshold for PascalVOC mAP, default=%(default)s', default=0.5)
 
     parser.add_argument(
         '--conf_threshold', type=float,
-        help='confidence threshold for filtering box in postprocess, default=0.001', default=0.001)
+        help='confidence threshold for filtering box in postprocess, default=%(default)s', default=0.001)
 
     parser.add_argument(
         '--model_image_size', type=str,
-        help='model image input size as <num>x<num>, default 416x416', default='416x416')
+        help='model image input size as <height>x<width>, default=%(default)s', default='416x416')
 
     parser.add_argument(
         '--save_result', default=False, action="store_true",
@@ -1110,11 +1316,15 @@ def main():
     class_names = get_classes(args.classes_path)
     height, width = args.model_image_size.split('x')
     model_image_size = (int(height), int(width))
+    assert (model_image_size[0]%32 == 0 and model_image_size[1]%32 == 0), 'model_image_size should be multiples of 32'
 
-    annotation_lines = get_dataset(args.annotation_file)
-    model, model_format = load_eval_model(args.model_path, args.custom_objects)
+    annotation_lines = get_dataset(args.annotation_file, shuffle=False)
+    model, model_format = load_eval_model(args.model_path)
 
+    start = time.time()
     eval_AP(model, model_format, annotation_lines, anchors, class_names, model_image_size, args.eval_type, args.iou_threshold, args.conf_threshold, args.save_result)
+    end = time.time()
+    print("Evaluation time cost: {:.6f}s".format(end - start))
 
 
 if __name__ == '__main__':

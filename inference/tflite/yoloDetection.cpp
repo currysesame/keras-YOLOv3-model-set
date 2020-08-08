@@ -17,6 +17,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <climits>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -88,33 +89,20 @@ void yolo_postprocess(const TfLiteTensor* feature_map, const int input_width, co
     // 1. do following transform to get the output bbox,
     //    which is aligned with YOLOv3/YOLOv2 paper:
     //
-    //    bbox_x = sigmoid(pred_x) + grid_w
-    //    bbox_y = sigmoid(pred_y) + grid_h
-    //    bbox_w = exp(pred_w) * anchor_w / stride
-    //    bbox_h = exp(pred_h) * anchor_h / stride
+    //    bbox_x = (sigmoid(pred_x) + grid_w) / grid_width
+    //    bbox_y = (sigmoid(pred_y) + grid_h) / grid_height
+    //    bbox_w = (exp(pred_w) * anchor_w) / input_width
+    //    bbox_h = (exp(pred_h) * anchor_h) / input_height
     //    bbox_obj = sigmoid(pred_obj)
     //
-    // 2. convert the grid scale coordinate back to
-    //    input image shape, with stride:
-    //
-    //    bbox_x = bbox_x * stride;
-    //    bbox_y = bbox_y * stride;
-    //    bbox_w = bbox_w * stride;
-    //    bbox_h = bbox_h * stride;
-    //
-    // 3. convert centoids to top left coordinates
-    //
-    //    bbox_x = bbox_x - (bbox_w / 2);
-    //    bbox_y = bbox_y - (bbox_h / 2);
-    //
-    // 4. get bbox confidence (class_score * objectness)
+    // 2. get bbox confidence (class_score * objectness)
     //    and filter with threshold
     //
     //    bbox_conf[:] = sigmoid/softmax(bbox_class_score[:]) * bbox_obj
     //    bbox_max_conf = max(bbox_conf[:])
     //    bbox_max_index = argmax(bbox_conf[:])
     //
-    // 5. filter bbox_max_conf with threshold
+    // 3. filter bbox_max_conf with threshold
     //
     //    if(bbox_max_conf > conf_threshold)
     //        enqueue the bbox info
@@ -153,21 +141,12 @@ void yolo_postprocess(const TfLiteTensor* feature_map, const int input_width, co
                     int bbox_scores_offset = h * width * channel + w * channel + anc * (num_classes + 5) + 5;
                     int bbox_scores_step = 1;
 
-                    float bbox_x = sigmoid(bytes[bbox_x_offset]) + w;
-                    float bbox_y = sigmoid(bytes[bbox_y_offset]) + h;
-                    float bbox_w = exp(bytes[bbox_w_offset]) * anchors[anc].first / stride;
-                    float bbox_h = exp(bytes[bbox_h_offset]) * anchors[anc].second / stride;
+                    // Decode YOLO predictions
+                    float bbox_x = (sigmoid(bytes[bbox_x_offset]) + w) / width;
+                    float bbox_y = (sigmoid(bytes[bbox_y_offset]) + h) / height;
+                    float bbox_w = exp(bytes[bbox_w_offset]) * anchors[anc].first / input_width;
+                    float bbox_h = exp(bytes[bbox_h_offset]) * anchors[anc].second / input_height;
                     float bbox_obj = sigmoid(bytes[bbox_obj_offset]);
-
-                    // Transfer anchor coordinates
-                    bbox_x = bbox_x * stride;
-                    bbox_y = bbox_y * stride;
-                    bbox_w = bbox_w * stride;
-                    bbox_h = bbox_h * stride;
-
-                    // Convert centoids to top left coordinates
-                    bbox_x = bbox_x - (bbox_w / 2);
-                    bbox_y = bbox_y - (bbox_h / 2);
 
                     // Get softmax score for YOLOv2 prediction
                     std::vector<float> logits_bbox_score;
@@ -448,93 +427,92 @@ void nms_boxes(const std::vector<t_prediction> prediction_list, std::vector<t_pr
 }
 
 
-void adjust_boxes(std::vector<t_prediction> &prediction_nms_list, int image_width, int image_height, int input_width, int input_height)
+void adjust_boxes(std::vector<t_prediction> &prediction_list, int image_width, int image_height, int input_width, int input_height)
 {
-    // Rescale the final prediction (letterboxed) back to original image
-    assert(input_width == input_height);
+    // Rescale the YOLO prediction (letterboxed) back to original image
+    float ratio = std::min(float(input_width)/float(image_width), float(input_height)/float(image_height));
 
-    int square_dim = std::max(image_width, image_height);
-    float scale = float(square_dim) / float(input_width);
-    int x_offset, y_offset;
+    float new_width = image_width * ratio;
+    float new_height = image_height * ratio;
 
-    if ( image_width > image_height ) {
-        x_offset = 0;
-        y_offset = floor((image_width - image_height) / 2);
-    }
-    else {
-        x_offset = floor((image_height - image_width) / 2);
-        y_offset = 0;
-    }
+    float x_offset = (input_width - new_width) / 2.0 / input_width;
+    float y_offset = (input_height - new_height) / 2.0 / input_height;
+    float scale_x = input_width / new_width;
+    float scale_y = input_height / new_height;
 
+    for(auto &prediction : prediction_list) {
+        prediction.x = (prediction.x - x_offset) * scale_x;
+        prediction.y = (prediction.y - y_offset) * scale_y;
+        prediction.width = prediction.width * scale_x;
+        prediction.height = prediction.height * scale_y;
 
-    for(auto &prediction_nms : prediction_nms_list) {
-        prediction_nms.x = prediction_nms.x * scale - x_offset;
-        prediction_nms.y = prediction_nms.y * scale - y_offset;
-        prediction_nms.width = prediction_nms.width * scale;
-        prediction_nms.height = prediction_nms.height * scale;
+        // Convert centoids to top left coordinates
+        prediction.x = prediction.x - (prediction.width / 2);
+        prediction.y = prediction.y - (prediction.height / 2);
+
+        // Scale boxes back to original image shape.
+        prediction.x = prediction.x * image_width;
+        prediction.y = prediction.y * image_height;
+        prediction.width = prediction.width * image_width;
+        prediction.height = prediction.height * image_height;
     }
 
     return;
 }
 
+
 //Resize image with unchanged aspect ratio using padding
-uint8_t* letterbox_image(uint8_t* inputImage, int image_width, int image_height, int image_channel)
+uint8_t* letterbox_resize(uint8_t* inputImage, int image_width, int image_height, int image_channel, int input_width, int input_height, int input_channel)
 {
-    // if input image is square, just return original
-    if (image_width == image_height) {
-        return inputImage;
+    // assume the data channel match
+    assert(image_channel == input_channel);
+
+    float scale = std::min(float(input_width)/float(image_width), float(input_height)/float(image_height));
+    int padding_width = int(image_width * scale);
+    int padding_height = int(image_height * scale);
+
+    int x_offset = int((input_width - padding_width) / 2);
+    int y_offset = int((input_height - padding_height) / 2);
+
+    uint8_t* padding_image = (uint8_t*)malloc(padding_height * padding_width * image_channel * sizeof(uint8_t));
+    if (padding_image == nullptr) {
+        LOG(ERROR) << "Can't alloc memory\n";
+        exit(-1);
     }
 
-    int square_dim = std::max(image_width, image_height);
-    int x_offset, y_offset;
+    stbir_resize_uint8(inputImage, image_width, image_height, 0,
+                     padding_image, padding_width, padding_height, 0, image_channel);
 
-    uint8_t* squareImage = (uint8_t*)malloc(square_dim * square_dim * image_channel * sizeof(uint8_t));
+    uint8_t* input_image = (uint8_t*)malloc(input_height * input_width * input_channel * sizeof(uint8_t));
+    // here we need to fulfill the input image to 128 first, to align with the training preprocess
+    memset((void*)input_image, 128, input_height * input_width * input_channel * sizeof(uint8_t));
 
-    if ( image_width > image_height ) {
-        x_offset = 0;
-        y_offset = floor((image_width - image_height) / 2);
-    }
-    else {
-        x_offset = floor((image_height - image_width) / 2);
-        y_offset = 0;
-    }
-
-    // paste input image into square image
-    for (int h = 0; h < image_height; h++) {
-        for (int w = 0; w < image_width; w++) {
+    // paste input image into letterbox image
+    for (int h = 0; h < padding_height; h++) {
+        for (int w = 0; w < padding_width; w++) {
             for (int c = 0; c < image_channel; c++) {
-                squareImage[(h+y_offset)*square_dim*image_channel + (w+x_offset)*image_channel + c] = inputImage[h*image_width*image_channel + w*image_channel + c];
+                input_image[(h+y_offset)*input_width*input_channel + (w+x_offset)*input_channel + c] = padding_image[h*padding_width*image_channel + w*image_channel + c];
             }
         }
     }
 
-    return squareImage;
+    free(padding_image);
+    return input_image;
 }
 
 
 template <class T>
-void resize(T* out, uint8_t* in, int image_width, int image_height,
-            int image_channels, int wanted_width, int wanted_height,
-            int wanted_channels, Settings* s) {
-  uint8_t* resized = (uint8_t*)malloc(wanted_height * wanted_width * wanted_channels * sizeof(uint8_t));
-  if (resized == nullptr) {
-      LOG(FATAL) << "Can't alloc memory" << "\n";
-      exit(-1);
-  }
-
-  stbir_resize_uint8(in, image_width, image_height, 0,
-                     resized, wanted_width, wanted_height, 0, wanted_channels);
-
-  auto output_number_of_pixels = wanted_height * wanted_width * wanted_channels;
+void fill_data(T* out, uint8_t* in, int input_width, int input_height,
+            int input_channels, Settings* s) {
+  auto output_number_of_pixels = input_height * input_width * input_channels;
 
   for (int i = 0; i < output_number_of_pixels; i++) {
     if (s->input_floating)
-      out[i] = (resized[i] - s->input_mean) / s->input_std;
+      out[i] = (in[i] - s->input_mean) / s->input_std;
     else
-      out[i] = (uint8_t)resized[i];
+      out[i] = (uint8_t)in[i];
   }
 
-  free(resized);
   return;
 }
 
@@ -557,7 +535,6 @@ void RunInference(Settings* s) {
   LOG(INFO) << "Loaded model " << s->model_name << "\n";
   model->error_reporter();
   LOG(INFO) << "resolved reporter\n";
-
 
   // prepare model interpreter
   tflite::ops::builtin::BuiltinOpResolver resolver;
@@ -595,39 +572,8 @@ void RunInference(Settings* s) {
       parse_anchors(line, anchors);
   }
 
-
-  // read input image
-  int image_width = 224;
-  int image_height = 224;
-  int image_channel = 3;
-
-  auto input_image = (uint8_t*)stbi_load(s->input_img_name.c_str(), &image_width, &image_height, &image_channel, 3);
-  if (input_image == nullptr) {
-      LOG(FATAL) << "Can't open" << s->input_img_name << "\n";
-      exit(-1);
-  }
-
-  // pad input image to letterboxed for input resize
-  uint8_t* letterboxImage = letterbox_image(input_image, image_width, image_height, image_channel);
-  int square_dim = std::max(image_width, image_height);
-
-  std::vector<uint8_t> in(letterboxImage, letterboxImage + square_dim * square_dim * image_channel * sizeof(uint8_t));
-
-  // free input image
-  stbi_image_free(input_image);
-  if(letterboxImage != input_image) {
-      free(letterboxImage);
-  }
-  input_image = nullptr;
-  letterboxImage = nullptr;
-
   // assuming one input only
   int input = interpreter->inputs()[0];
-
-  LOG(INFO) << "origin image size: width:" << image_width
-            << ", height:" << image_height
-            << ", channel:" << image_channel
-            << "\n";
 
   // get input dimension from the input tensor metadata
   TfLiteIntArray* dims = interpreter->tensor(input)->dims;
@@ -642,21 +588,38 @@ void RunInference(Settings* s) {
                             << "height " << input_height << ", "
                             << "width " << input_width << ", "
                             << "channels " << input_channels << "\n";
-  // assume the model input is square
-  assert(input_width == input_height);
 
-  // resize image to model input shape
+  // read input image
+  int image_width, image_height, image_channel;
+
+  auto input_image = (uint8_t*)stbi_load(s->input_img_name.c_str(), &image_width, &image_height, &image_channel, 3);
+  if (input_image == nullptr) {
+      LOG(FATAL) << "Can't open" << s->input_img_name << "\n";
+      exit(-1);
+  }
+
+  LOG(INFO) << "origin image size: width:" << image_width
+            << ", height:" << image_height
+            << ", channel:" << image_channel
+            << "\n";
+
+  // do letterbox resize to input image
+  uint8_t* letterboxImage = letterbox_resize(input_image, image_width, image_height, image_channel, input_width, input_height, input_channels);
+
+  // free input image
+  stbi_image_free(input_image);
+  input_image = nullptr;
+
+  // fulfill image data to model input tensor
   switch (interpreter->tensor(input)->type) {
     case kTfLiteFloat32:
       s->input_floating = true;
-      resize<float>(interpreter->typed_tensor<float>(input), in.data(),
-                    square_dim, square_dim, image_channel, input_width,
-                    input_height, input_channels, s);
+      fill_data<float>(interpreter->typed_tensor<float>(input), letterboxImage,
+                    input_width, input_height, input_channels, s);
       break;
     case kTfLiteUInt8:
-      resize<uint8_t>(interpreter->typed_tensor<uint8_t>(input), in.data(),
-                      square_dim, square_dim, image_channel, input_width,
-                      input_height, input_channels, s);
+      fill_data<uint8_t>(interpreter->typed_tensor<uint8_t>(input), letterboxImage,
+                    input_width, input_height, input_channels, s);
       break;
     default:
       LOG(FATAL) << "cannot handle input type "
@@ -687,7 +650,7 @@ void RunInference(Settings* s) {
 
   // Do yolo_postprocess to parse out valid predictions
   std::vector<t_prediction> prediction_list;
-  float conf_threshold = 0.1;
+  float conf_threshold = s->conf_thrd;
   float iou_threshold = 0.4;
   const std::vector<int> outputs = interpreter->outputs();
 
@@ -718,6 +681,8 @@ void RunInference(Settings* s) {
   gettimeofday(&stop_time, nullptr);
   LOG(INFO) << "yolo_postprocess time: " << (get_us(stop_time) - get_us(start_time)) / 1000 << " ms\n";
 
+  // Rescale the prediction back to original image
+  adjust_boxes(prediction_list, image_width, image_height, input_width, input_height);
 
   // Do NMS for predictions
   std::vector<t_prediction> prediction_nms_list;
@@ -726,17 +691,42 @@ void RunInference(Settings* s) {
   gettimeofday(&stop_time, nullptr);
   LOG(INFO) << "NMS time: " << (get_us(stop_time) - get_us(start_time)) / 1000 << " ms\n";
 
-  // Rescale the prediction back to original image
-  adjust_boxes(prediction_nms_list, image_width, image_height, input_width, input_height);
+
+  // Open result txt file, in append mode
+  std::ofstream resultOs (s->result_file_name.c_str(), std::ios::out | std::ios::app);
+  // Get real path for input image
+  char real_path_buff[PATH_MAX];
+  if(realpath(s->input_img_name.c_str(), real_path_buff)) {
+      resultOs << real_path_buff;
+  } else {
+      LOG(FATAL) << "fail to get image real path!\n";
+      exit(-1);
+  }
 
   // Show detection result
   LOG(INFO) << "Detection result:\n";
   for(auto prediction_nms : prediction_nms_list) {
+      // change box to (xmin,ymin,xmax,ymax) format
+      int x_min = std::max(0, int(prediction_nms.x));
+      int y_min = std::max(0, int(prediction_nms.y));
+      int x_max = std::min(image_width, int(prediction_nms.x + prediction_nms.width));
+      int y_max = std::min(image_height, int(prediction_nms.y + prediction_nms.height));
+
       LOG(INFO) << classes[prediction_nms.class_index] << " "
                 << prediction_nms.confidence << " "
-                << "(" << int(prediction_nms.x) << ", " << int(prediction_nms.y) << ")"
-                << " (" << int(prediction_nms.x + prediction_nms.width) << ", " << int(prediction_nms.y + prediction_nms.height) << ")\n";
+                << "(" << x_min << ", " << y_min << ")"
+                << " (" << x_max << ", " << y_max << ")\n";
+      // save detection result to file
+      resultOs << " "
+               << x_min << ","
+               << y_min << ","
+               << x_max << ","
+               << y_max << ","
+               << prediction_nms.class_index << ","
+               << prediction_nms.confidence;
   }
+  resultOs << "\n";
+  resultOs.close();
 
   return;
 }
@@ -748,12 +738,14 @@ void display_usage() {
       << "--image, -i: image_name.jpg\n"
       << "--classes, -l: classes labels for the model\n"
       << "--anchors, -a: anchor values for the model\n"
+      << "--conf_thrd, -n: confidence threshold for detection filter\n"
       << "--input_mean, -b: input mean\n"
       << "--input_std, -s: input standard deviation\n"
       << "--allow_fp16, -f: [0|1], allow running fp32 models with fp16 or not\n"
       << "--threads, -t: number of threads\n"
       << "--count, -c: loop interpreter->Invoke() for certain times\n"
       << "--warmup_runs, -w: number of warmup runs\n"
+      << "--result, -r: result txt file to save detection output\n"
       << "--verbose, -v: [0|1] print more information\n"
       << "\n";
 }
@@ -768,12 +760,14 @@ int Main(int argc, char** argv) {
         {"image", required_argument, nullptr, 'i'},
         {"classes", required_argument, nullptr, 'l'},
         {"anchors", required_argument, nullptr, 'a'},
+        {"conf_thrd", required_argument, nullptr, 'n'},
         {"input_mean", required_argument, nullptr, 'b'},
         {"input_std", required_argument, nullptr, 's'},
         {"threads", required_argument, nullptr, 't'},
         {"allow_fp16", required_argument, nullptr, 'f'},
         {"count", required_argument, nullptr, 'c'},
         {"warmup_runs", required_argument, nullptr, 'w'},
+        {"result", required_argument, nullptr, 'r'},
         {"verbose", required_argument, nullptr, 'v'},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}};
@@ -782,7 +776,7 @@ int Main(int argc, char** argv) {
     int option_index = 0;
 
     c = getopt_long(argc, argv,
-                    "a:b:c:f:hi:l:m:s:t:v:w:", long_options,
+                    "a:b:c:f:hi:l:m:n:r:s:t:v:w:", long_options,
                     &option_index);
 
     /* Detect the end of the options. */
@@ -812,6 +806,9 @@ int Main(int argc, char** argv) {
       case 'm':
         s.model_name = optarg;
         break;
+      case 'n':
+        s.conf_thrd = strtod(optarg, nullptr);
+        break;
       case 's':
         s.input_std = strtod(optarg, nullptr);
         break;
@@ -826,6 +823,9 @@ int Main(int argc, char** argv) {
       case 'w':
         s.number_of_warmup_runs =
             strtol(optarg, nullptr, 10);  // NOLINT(runtime/deprecated_fn)
+        break;
+      case 'r':
+        s.result_file_name = optarg;
         break;
       case 'h':
       case '?':

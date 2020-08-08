@@ -14,6 +14,8 @@ from yolo2.models.yolo2_mobilenet import yolo2_mobilenet_body, yolo2lite_mobilen
 from yolo2.models.yolo2_mobilenetv2 import yolo2_mobilenetv2_body, yolo2lite_mobilenetv2_body, tiny_yolo2_mobilenetv2_body, tiny_yolo2lite_mobilenetv2_body
 from yolo2.models.yolo2_xception import yolo2_xception_body, yolo2lite_xception_body
 from yolo2.models.yolo2_efficientnet import yolo2_efficientnet_body, yolo2lite_efficientnet_body, tiny_yolo2_efficientnet_body, tiny_yolo2lite_efficientnet_body
+from yolo2.models.yolo2_mobilenetv3_large import yolo2_mobilenetv3large_body, yolo2lite_mobilenetv3large_body, tiny_yolo2_mobilenetv3large_body, tiny_yolo2lite_mobilenetv3large_body
+from yolo2.models.yolo2_mobilenetv3_small import yolo2_mobilenetv3small_body, yolo2lite_mobilenetv3small_body, tiny_yolo2_mobilenetv3small_body, tiny_yolo2lite_mobilenetv3small_body
 from yolo2.loss import yolo2_loss
 from yolo2.postprocess import batched_yolo2_postprocess
 
@@ -32,6 +34,11 @@ yolo2_model_map = {
     'yolo2_mobilenetv2': [yolo2_mobilenetv2_body, 155, None],
     'yolo2_mobilenetv2_lite': [yolo2lite_mobilenetv2_body, 155, None],
 
+    'yolo2_mobilenetv3large': [yolo2_mobilenetv3large_body, 195, None],
+    'yolo2_mobilenetv3large_lite': [yolo2lite_mobilenetv3large_body, 195, None],
+    'yolo2_mobilenetv3small': [yolo2_mobilenetv3small_body, 166, None],
+    'yolo2_mobilenetv3small_lite': [yolo2lite_mobilenetv3small_body, 166, None],
+
     # NOTE: backbone_length is for EfficientNetB0
     # if change to other efficientnet level, you need to modify it
     'yolo2_efficientnet': [yolo2_efficientnet_body, 235, None],
@@ -45,6 +52,11 @@ yolo2_model_map = {
     'tiny_yolo2_mobilenet_lite': [tiny_yolo2lite_mobilenet_body, 87, None],
     'tiny_yolo2_mobilenetv2': [tiny_yolo2_mobilenetv2_body, 155, None],
     'tiny_yolo2_mobilenetv2_lite': [tiny_yolo2lite_mobilenetv2_body, 155, None],
+
+    'tiny_yolo2_mobilenetv3large': [tiny_yolo2_mobilenetv3large_body, 195, None],
+    'tiny_yolo2_mobilenetv3large_lite': [tiny_yolo2lite_mobilenetv3large_body, 195, None],
+    'tiny_yolo2_mobilenetv3small': [tiny_yolo2_mobilenetv3small_body, 166, None],
+    'tiny_yolo2_mobilenetv3small_lite': [tiny_yolo2lite_mobilenetv3small_body, 166, None],
 
     # NOTE: backbone_length is for EfficientNetB0
     # if change to other efficientnet level, you need to modify it
@@ -114,12 +126,12 @@ def get_yolo2_train_model(model_type, anchors, num_classes, weights_path=None, f
 
     model = Model([model_body.input, y_true_input], model_loss)
 
+    loss_dict = {'location_loss':location_loss, 'confidence_loss':confidence_loss, 'class_loss':class_loss}
+    add_metrics(model, loss_dict)
+
     model.compile(optimizer=optimizer, loss={
         # use custom yolo_loss Lambda layer.
         'yolo_loss': lambda y_true, y_pred: y_pred})
-
-    loss_dict = {'location_loss':location_loss, 'confidence_loss':confidence_loss, 'class_loss':class_loss}
-    add_metrics(model, loss_dict)
 
     return model
 

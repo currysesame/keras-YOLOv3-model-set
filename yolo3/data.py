@@ -5,11 +5,11 @@ import numpy as np
 import random, math
 from PIL import Image
 from tensorflow.keras.utils import Sequence
-from common.data_utils import normalize_image, letterbox_resize, random_resize_crop_pad, reshape_boxes, random_hsv_distort, random_horizontal_flip, random_vertical_flip, random_grayscale, random_brightness, random_chroma, random_contrast, random_sharpness
+from common.data_utils import normalize_image, letterbox_resize, random_resize_crop_pad, reshape_boxes, random_hsv_distort, random_horizontal_flip, random_vertical_flip, random_grayscale, random_brightness, random_chroma, random_contrast, random_sharpness, random_blur, random_motion_blur, random_mosaic_augment
 from common.utils import get_multiscale_list
 
 
-def get_ground_truth_data(annotation_line, input_shape, augment=True, max_boxes=20):
+def get_ground_truth_data(annotation_line, input_shape, augment=True, max_boxes=100):
     '''random preprocessing for real-time data augmentation'''
     line = annotation_line.split()
     image = Image.open(line[0])
@@ -55,6 +55,12 @@ def get_ground_truth_data(annotation_line, input_shape, augment=True, max_boxes=
     # random convert image to grayscale
     image = random_grayscale(image)
 
+    # random do normal blur to image
+    #image = random_blur(image)
+
+    # random do motion blur to image
+    #image = random_motion_blur(image, prob=0.2)
+
     # random vertical flip image
     image, vertical_flip = random_vertical_flip(image)
 
@@ -78,7 +84,7 @@ def get_ground_truth_data(annotation_line, input_shape, augment=True, max_boxes=
     return image_data, box_data
 
 
-def preprocess_true_boxes(true_boxes, input_shape, anchors, num_classes):
+def preprocess_true_boxes(true_boxes, input_shape, anchors, num_classes, multi_anchor_assign, iou_thresh=0.2):
     '''Preprocess true boxes to training input format
 
     Parameters
@@ -107,9 +113,9 @@ def preprocess_true_boxes(true_boxes, input_shape, anchors, num_classes):
     true_boxes[..., 0:2] = boxes_xy/input_shape[::-1]
     true_boxes[..., 2:4] = boxes_wh/input_shape[::-1]
 
-    m = true_boxes.shape[0]
+    batch_size = true_boxes.shape[0]
     grid_shapes = [input_shape//{0:32, 1:16, 2:8}[l] for l in range(num_layers)]
-    y_true = [np.zeros((m,grid_shapes[l][0],grid_shapes[l][1],len(anchor_mask[l]),5+num_classes),
+    y_true = [np.zeros((batch_size, grid_shapes[l][0], grid_shapes[l][1], len(anchor_mask[l]), 5+num_classes),
         dtype='float32') for l in range(num_layers)]
 
     # Expand dim to apply broadcasting.
@@ -118,10 +124,12 @@ def preprocess_true_boxes(true_boxes, input_shape, anchors, num_classes):
     anchor_mins = -anchor_maxes
     valid_mask = boxes_wh[..., 0]>0
 
-    for b in range(m):
+    for b in range(batch_size):
         # Discard zero rows.
         wh = boxes_wh[b, valid_mask[b]]
-        if len(wh)==0: continue
+        if len(wh)==0:
+            continue
+
         # Expand dim to apply broadcasting.
         wh = np.expand_dims(wh, -2)
         box_maxes = wh / 2.
@@ -135,37 +143,55 @@ def preprocess_true_boxes(true_boxes, input_shape, anchors, num_classes):
         anchor_area = anchors[..., 0] * anchors[..., 1]
         iou = intersect_area / (box_area + anchor_area - intersect_area)
 
-        # Find best anchor for each true box
-        best_anchor = np.argmax(iou, axis=-1)
+        # Sort anchors according to IoU score
+        # to find out best assignment
+        best_anchors = np.argsort(iou, axis=-1)[..., ::-1]
 
-        for t, n in enumerate(best_anchor):
+        if not multi_anchor_assign:
+            best_anchors = best_anchors[..., 0]
+            # keep index dim for the loop in following
+            best_anchors = np.expand_dims(best_anchors, -1)
+
+        for t, row in enumerate(best_anchors):
             for l in range(num_layers):
-                if n in anchor_mask[l]:
-                    i = np.floor(true_boxes[b,t,0]*grid_shapes[l][1]).astype('int32')
-                    j = np.floor(true_boxes[b,t,1]*grid_shapes[l][0]).astype('int32')
-                    k = anchor_mask[l].index(n)
-                    c = true_boxes[b,t, 4].astype('int32')
-                    y_true[l][b, j, i, k, 0:4] = true_boxes[b,t, 0:4]
-                    y_true[l][b, j, i, k, 4] = 1
-                    y_true[l][b, j, i, k, 5+c] = 1
+                for n in row:
+                    # use different matching policy for single & multi anchor assign
+                    if multi_anchor_assign:
+                        matching_rule = (iou[t, n] > iou_thresh and n in anchor_mask[l])
+                    else:
+                        matching_rule = (n in anchor_mask[l])
+
+                    if matching_rule:
+                        i = np.floor(true_boxes[b,t,0]*grid_shapes[l][1]).astype('int32')
+                        j = np.floor(true_boxes[b,t,1]*grid_shapes[l][0]).astype('int32')
+                        k = anchor_mask[l].index(n)
+                        c = true_boxes[b,t, 4].astype('int32')
+                        y_true[l][b, j, i, k, 0:4] = true_boxes[b,t, 0:4]
+                        y_true[l][b, j, i, k, 4] = 1
+                        y_true[l][b, j, i, k, 5+c] = 1
 
     return y_true
 
 
 class Yolo3DataGenerator(Sequence):
-    def __init__(self, annotation_lines, batch_size, input_shape, anchors, num_classes, rescale_interval=-1, shuffle=True):
+    def __init__(self, annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment=None, rescale_interval=-1, multi_anchor_assign=False, shuffle=True, **kwargs):
         self.annotation_lines = annotation_lines
         self.batch_size = batch_size
         self.input_shape = input_shape
         self.anchors = anchors
         self.num_classes = num_classes
+        self.enhance_augment = enhance_augment
+        self.multi_anchor_assign = multi_anchor_assign
         self.indexes = np.arange(len(self.annotation_lines))
         self.shuffle = shuffle
         # prepare multiscale config
         # TODO: error happens when using Sequence data generator with
         #       multiscale input shape, disable multiscale first
+        if rescale_interval != -1:
+            raise ValueError("tf.keras.Sequence generator doesn't support multiscale input, pls remove related config")
         #self.rescale_interval = rescale_interval
         self.rescale_interval = -1
+
         self.rescale_step = 0
         self.input_shape_list = get_multiscale_list()
 
@@ -193,7 +219,12 @@ class Yolo3DataGenerator(Sequence):
             box_data.append(box)
         image_data = np.array(image_data)
         box_data = np.array(box_data)
-        y_true = preprocess_true_boxes(box_data, self.input_shape, self.anchors, self.num_classes)
+
+        if self.enhance_augment == 'mosaic':
+            # add random mosaic augment on batch ground truth data
+            image_data, box_data = random_mosaic_augment(image_data, box_data, prob=0.2)
+
+        y_true = preprocess_true_boxes(box_data, self.input_shape, self.anchors, self.num_classes, self.multi_anchor_assign)
 
         return [image_data, *y_true], np.zeros(self.batch_size)
 
@@ -204,7 +235,7 @@ class Yolo3DataGenerator(Sequence):
 
 
 
-def yolo3_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, rescale_interval):
+def yolo3_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment, rescale_interval, multi_anchor_assign):
     '''data generator for fit_generator'''
     n = len(annotation_lines)
     i = 0
@@ -229,12 +260,16 @@ def yolo3_data_generator(annotation_lines, batch_size, input_shape, anchors, num
             i = (i+1) % n
         image_data = np.array(image_data)
         box_data = np.array(box_data)
-        y_true = preprocess_true_boxes(box_data, input_shape, anchors, num_classes)
+
+        if enhance_augment == 'mosaic':
+            # add random mosaic augment on batch ground truth data
+            image_data, box_data = random_mosaic_augment(image_data, box_data, prob=0.2)
+
+        y_true = preprocess_true_boxes(box_data, input_shape, anchors, num_classes, multi_anchor_assign)
         yield [image_data, *y_true], np.zeros(batch_size)
 
-def yolo3_data_generator_wrapper(annotation_lines, batch_size, input_shape, anchors, num_classes, rescale_interval=-1):
+def yolo3_data_generator_wrapper(annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment=None, rescale_interval=-1, multi_anchor_assign=False, **kwargs):
     n = len(annotation_lines)
     if n==0 or batch_size<=0: return None
-    return yolo3_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, rescale_interval)
-
+    return yolo3_data_generator(annotation_lines, batch_size, input_shape, anchors, num_classes, enhance_augment, rescale_interval, multi_anchor_assign)
 
